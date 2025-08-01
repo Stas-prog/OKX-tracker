@@ -2,6 +2,8 @@
 
 import { useEffect, useState } from 'react'
 import axios from 'axios'
+import VirtualTraderStatus from './components/VirtualTraderStatus';
+
 
 type Ticker = {
   instId: string
@@ -48,6 +50,7 @@ export default function HomePage() {
           </li>
         ))}
       </ul>
+      <VirtualTraderStatus />
     </main>
   )
 }
