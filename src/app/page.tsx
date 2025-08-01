@@ -3,6 +3,8 @@
 import { useEffect, useState } from 'react'
 import axios from 'axios'
 import VirtualTraderStatus from './components/VirtualTraderStatus';
+import VirtualTraderTable from './components/VirtualTraderTable';
+
 
 
 type Ticker = {
@@ -51,6 +53,7 @@ export default function HomePage() {
         ))}
       </ul>
       <VirtualTraderStatus />
+      <VirtualTraderTable />
     </main>
   )
 }
