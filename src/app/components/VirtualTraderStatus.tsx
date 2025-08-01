@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 
 export default function VirtualTraderStatus() {
-    const [status, setStatus] = useState<any>(null);
+    const [status, setStatus] = useState<any | null>(null);
 
     useEffect(() => {
         const interval = setInterval(async () => {
