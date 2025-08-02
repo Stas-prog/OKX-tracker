@@ -1,10 +1,28 @@
 import { strategies } from './strategies';
+import { sendTelegramMessage } from './sendTelegramMessage';
+
+
+type Trade = {
+    time: string;
+    type: 'buy' | 'sell';
+    price: number;
+    instId: string;
+};
 
 type PositionState = {
     position: 'none' | 'long';
     entryPrice: number | null;
     pnl: number;
 };
+
+const tradeHistory: Trade[] = [];
+
+export function getTradeHistory() {
+    return tradeHistory;
+}
+
+
+
 
 const state: Record<string, PositionState> = {};
 
@@ -25,11 +43,29 @@ export async function checkAllStrategies() {
         if (s.position === 'none' && currentPrice < strat.buyBelow) {
             s.position = 'long';
             s.entryPrice = currentPrice;
-        } else if (s.position === 'long' && currentPrice > strat.sellAbove) {
+            tradeHistory.push({
+                time: new Date().toISOString(),
+                type: 'buy',
+                price: currentPrice,
+                instId: strat.instId,
+            });
+            sendTelegramMessage(`🚀 Купівля ${strat.instId} за ${currentPrice.toFixed(2)}!`);
+
+        }
+        else if (s.position === 'long' && currentPrice > strat.sellAbove) {
             s.pnl += currentPrice - (s.entryPrice || 0);
+            tradeHistory.push({
+                time: new Date().toISOString(),
+                type: 'sell',
+                price: currentPrice,
+                instId: strat.instId,
+            });
             s.position = 'none';
             s.entryPrice = null;
+            sendTelegramMessage(`💰 Продаж ${strat.instId} за ${currentPrice.toFixed(2)}! Прибуток: ${(currentPrice - (s.entryPrice || 0)).toFixed(2)}`);
+
         }
+
 
         results.push({
             ...strat,

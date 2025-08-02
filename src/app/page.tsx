@@ -4,6 +4,9 @@ import { useEffect, useState } from 'react'
 import axios from 'axios'
 import VirtualTraderStatus from './components/VirtualTraderStatus';
 import VirtualTraderTable from './components/VirtualTraderTable';
+import TradeHistoryTable from './components/TradeHistoryTable';
+import BTCChart from './components/BTCChart'
+
 
 
 
@@ -54,6 +57,8 @@ export default function HomePage() {
       </ul>
       <VirtualTraderStatus />
       <VirtualTraderTable />
+      <TradeHistoryTable />
+      <BTCChart />
     </main>
   )
 }
