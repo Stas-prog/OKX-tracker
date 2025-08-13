@@ -6,6 +6,8 @@ import VirtualTraderStatus from './components/VirtualTraderStatus';
 import VirtualTraderTable from './components/VirtualTraderTable';
 import TradeHistoryTable from './components/TradeHistoryTable';
 import BTCChart from './components/BTCChart'
+import BTCBot from './components/BTCBot'
+import Bot from './components/Bot'
 
 
 
@@ -59,6 +61,8 @@ export default function HomePage() {
       <VirtualTraderTable />
       <TradeHistoryTable />
       <BTCChart />
+      <BTCBot />
+      <Bot />
     </main>
   )
 }
