@@ -1,22 +1,17 @@
 import { MongoClient } from "mongodb";
 
-const uri = process.env.MONGODB_URI!;
-const dbName = process.env.MONGODB_DB || "okx_tracker";
-
-let client: MongoClient | null = null;
-let clientPromise: Promise<MongoClient>;
-
-declare global {
-    var _mongoClientPromise: Promise<MongoClient> | undefined;
-}
-
-if (!global._mongoClientPromise) {
-    client = new MongoClient(uri, {});
-    global._mongoClientPromise = client.connect();
-}
-clientPromise = global._mongoClientPromise;
+let clientPromise: Promise<MongoClient> | null = null;
 
 export async function getDb() {
-    const c = await clientPromise;
-    return c.db(dbName);
+    const uri = process.env.MONGODB_URI;
+    if (!uri) {
+        throw new Error("MONGODB_URI is not set");
+    }
+    if (!clientPromise) {
+        const client = new MongoClient(uri, {});
+        clientPromise = client.connect();
+    }
+    const client = await clientPromise;
+    const dbName = process.env.MONGODB_DB || "okx_tracker";
+    return client.db(dbName);
 }

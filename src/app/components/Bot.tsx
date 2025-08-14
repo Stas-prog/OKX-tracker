@@ -204,11 +204,15 @@ export default function Bot() {
             }
 
             // формуємо pending на наступну свічку
+
             if (!next.position && wasAbove === false && isAbove === true) {
+                console.log("[SIGNAL] BUY on close", new Date(c.ts).toISOString(), c.close);
                 next.pending = { side: "BUY", forTs: c.ts };
             } else if (next.position && wasAbove === true && isAbove === false) {
+                console.log("[SIGNAL] SELL on close", new Date(c.ts).toISOString(), c.close);
                 next.pending = { side: "SELL", forTs: c.ts };
             }
+
 
             next.equityUSDT = computeEquity(next, c.close);
             return next;
@@ -260,6 +264,8 @@ export default function Bot() {
                     const isNewBar = lastBarTsRef.current !== candle.ts;
                     if (isNewBar && simRef.current?.pending) {
                         const p = simRef.current.pending!;
+                        console.log("[EXEC] at next open", p.side, new Date(candle.ts).toISOString(), "open:", candle.open);
+
                         setSim((prev) => {
                             let after = execAtOpen(prev, p.side, candle.open, candle.ts);
                             after.pending = null;
@@ -307,7 +313,6 @@ export default function Bot() {
                 } catch { }
             }
         })();
-        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     // Перевірка instId → конект (ЛИШЕ при зміні інструмента/TF)
@@ -332,6 +337,26 @@ export default function Bot() {
                 ema12: undefined, ema26: undefined, lastClosedTs: undefined, pending: null,
             });
             lastBarTsRef.current = null;
+
+            // Warmup історією (одноразово)
+            try {
+                const bar = tf === "1m" ? "1m" : tf; // 1m/5m/15m
+                const url = `https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=${bar}&limit=150`;
+                const res = await fetch(url, { cache: "no-store" });
+                const json = await res.json();
+                const rows: string[][] = Array.isArray(json.data) ? json.data : [];
+                // OKX повертає від нових до старих — реверсимо
+                const warm = rows.slice().reverse().map(r => parseCandleRow(r)).filter(Boolean) as Candle[];
+                // Підкинемо в state та перерахуймо EMA-серії
+                setCandles(warm.slice(-400));
+                if (warm.length) {
+                    const lastC = warm[warm.length - 1];
+                    setLast(lastC);
+                }
+            } catch (e) {
+                console.warn("Warmup failed:", e);
+            }
+
 
             connect();
         })();

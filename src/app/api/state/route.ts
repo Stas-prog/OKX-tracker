@@ -1,6 +1,11 @@
 import { NextResponse } from "next/server";
 import { getDb } from "@/lib/mongo";
 
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+export const revalidate = 0;
+
+
 // Опис документу у колекції "state": _id — РЯДОК, а не ObjectId
 type StateDoc = {
     _id: string;                 // напр. "sim"

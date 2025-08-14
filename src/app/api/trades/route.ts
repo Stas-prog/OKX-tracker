@@ -1,6 +1,11 @@
 import { NextResponse } from "next/server";
 import { getDb } from "@/lib/mongo";
 
+export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
+export const revalidate = 0;
+
+
 export async function GET() {
     const db = await getDb();
     const trades = await db.collection("trades").find({}).sort({ ts: -1 }).limit(500).toArray();
