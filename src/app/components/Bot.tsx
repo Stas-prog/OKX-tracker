@@ -1,7 +1,9 @@
+// src/components/Bot.tsx
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CandlesChart, { Candle as ChartCandle, Trade as ChartTrade } from "@/app/components/CandlesChart";
+import { useTraderStore } from "@/store/trader";
 
 /* ================= Types & consts ================= */
 type InstType = "SPOT" | "SWAP" | "FUTURES";
@@ -12,7 +14,6 @@ type OkxEvent =
     | Record<string, unknown>;
 
 const WS_URL = "wss://ws.okx.com:8443/ws/v5/business";
-// таймфрейми
 const TF_MAP = { "1m": "candle1m", "5m": "candle5m", "15m": "candle15m" } as const;
 type TF = keyof typeof TF_MAP;
 
@@ -41,6 +42,7 @@ async function existsInstId(id: string) {
     }
 }
 
+// OKX row: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
 function parseCandleRow(row: string[]): Candle | null {
     try {
         const [ts, o, h, l, c, vol, _v1, _v2, confirm] = row;
@@ -58,7 +60,7 @@ function parseCandleRow(row: string[]): Candle | null {
     }
 }
 
-// EMA α = 2/(n+1)
+// EMA
 function emaNext(prev: number | undefined, price: number, period: number): number {
     const alpha = 2 / (period + 1);
     return prev === undefined ? price : prev + alpha * (price - prev);
@@ -67,6 +69,7 @@ function emaNext(prev: number | undefined, price: number, period: number): numbe
 /* ================= Trading simulation ================= */
 type Position = { entry: number; qty: number; entryTs: number };
 type Trade = ChartTrade;
+type PendingOrder = { side: "BUY" | "SELL"; forTs: number } | null;
 
 type SimState = {
     cashUSDT: number;
@@ -76,23 +79,35 @@ type SimState = {
     ema12?: number;
     ema26?: number;
     lastClosedTs?: number;
+    pending?: PendingOrder;
 };
 
-// налаштування
 const FAST = 12, SLOW = 26;
 const TAKE_PROFIT = 0.04; // +4%
 const STOP_LOSS = 0.02; // -2%
 const FEE_RATE = 0.001; // 0.1%
+const SLIPPAGE = 0.0005; // 0.05%
 
 function computeEquity(state: SimState, mark: number): number {
     if (!state.position) return state.cashUSDT;
     return state.cashUSDT + state.position.qty * mark;
 }
 
+async function saveTradeToDB(t: Trade & { instId: string; tf: string }) {
+    try {
+        await fetch("/api/trades", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ ...t, createdAt: new Date().toISOString() }),
+        });
+    } catch (e) {
+        console.error("saveTradeToDB", e);
+    }
+}
+
 function tryEnter(state: SimState, price: number, ts: number): SimState {
     if (state.position || state.cashUSDT <= 0) return state;
-    // fee в котир. валюті → менше купимо базової
-    const qty = (state.cashUSDT * (1 - FEE_RATE)) / price;
+    const qty = (state.cashUSDT * (1 - FEE_RATE)) / price; // fee на купівлі
     const pos: Position = { entry: price, qty, entryTs: ts };
     const buy: Trade = { side: "BUY", price, qty, ts };
     const next: SimState = {
@@ -125,6 +140,11 @@ function tryExit(state: SimState, price: number, ts: number): SimState {
     return next;
 }
 
+function execAtOpen(next: SimState, side: "BUY" | "SELL", open: number, ts: number): SimState {
+    const px = side === "BUY" ? open * (1 + SLIPPAGE) : open * (1 - SLIPPAGE);
+    return side === "BUY" ? tryEnter(next, px, ts) : tryExit(next, px, ts);
+}
+
 /* ================= Component ================= */
 export default function Bot() {
     const [instId, setInstId] = useState<string>("BTC-USDT");
@@ -145,7 +165,16 @@ export default function Bot() {
         ema12: undefined,
         ema26: undefined,
         lastClosedTs: undefined,
+        pending: null,
     }));
+
+    // Zustand local persist
+    const { simSnapshot, setSimSnapshot } = useTraderStore();
+
+    // refs
+    const simRef = useRef(sim);
+    useEffect(() => { simRef.current = sim; }, [sim]);
+    const lastBarTsRef = useRef<number | null>(null);
 
     const channel = TF_MAP[tf];
     const arg: OkxArg = useMemo(() => ({ channel, instId }), [channel, instId]);
@@ -153,19 +182,7 @@ export default function Bot() {
     const wsRef = useRef<WebSocket | null>(null);
     const reconnectTimer = useRef<number | null>(null);
 
-    const subscribeCandles = useCallback(() => {
-        const ws = wsRef.current;
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        ws.send(JSON.stringify({ op: "subscribe", args: [arg] }));
-    }, [arg]);
-
-    const unsubscribeCandles = useCallback((prev: OkxArg) => {
-        const ws = wsRef.current;
-        if (!ws || ws.readyState !== WebSocket.OPEN) return;
-        ws.send(JSON.stringify({ op: "unsubscribe", args: [prev] }));
-    }, []);
-
-    // Симуляція на закритій свічці
+    // Обробка ЗАКРИТОЇ свічки → сигнали + pending
     const onClosedCandle = useCallback((c: Candle) => {
         setSim((prev) => {
             if (prev.lastClosedTs === c.ts) return prev;
@@ -178,7 +195,7 @@ export default function Bot() {
             const wasAbove = prev.ema12 !== undefined && prev.ema26 !== undefined && prev.ema12 > prev.ema26;
             const isAbove = ema12 > ema26;
 
-            // стоп/тейк у відкритій позиції
+            // стоп/тейк на close закритої свічки
             if (next.position) {
                 const pnlPct = (c.close - next.position.entry) / next.position.entry;
                 if (pnlPct >= TAKE_PROFIT || pnlPct <= -STOP_LOSS) {
@@ -186,11 +203,11 @@ export default function Bot() {
                 }
             }
 
-            // сигнали кросу
+            // формуємо pending на наступну свічку
             if (!next.position && wasAbove === false && isAbove === true) {
-                next = tryEnter(next, c.close, c.ts);
+                next.pending = { side: "BUY", forTs: c.ts };
             } else if (next.position && wasAbove === true && isAbove === false) {
-                next = tryExit(next, c.close, c.ts);
+                next.pending = { side: "SELL", forTs: c.ts };
             }
 
             next.equityUSDT = computeEquity(next, c.close);
@@ -198,21 +215,20 @@ export default function Bot() {
         });
     }, []);
 
-    // Підключення WS
+    // Стабільний connect: залежить тільки від instId/TF (через arg.*)
     const connect = useCallback(() => {
         if (wsRef.current) {
             try { wsRef.current.close(); } catch { }
             wsRef.current = null;
         }
-        setStatus("connecting");
-        setErr(null);
+        setStatus("connecting"); setErr(null);
 
         const ws = new WebSocket(WS_URL);
         wsRef.current = ws;
 
         ws.addEventListener("open", () => {
             setStatus("open");
-            subscribeCandles();
+            ws.send(JSON.stringify({ op: "subscribe", args: [arg] }));
         });
 
         ws.addEventListener("message", (evt) => {
@@ -220,8 +236,7 @@ export default function Bot() {
                 const parsed = JSON.parse(String(evt.data)) as OkxEvent | OkxCandleMsg;
 
                 if ("event" in parsed && parsed.event === "error") {
-                    const msg = `OKX WS error: ${parsed.code ?? ""} ${parsed.msg ?? ""}`.trim();
-                    setErr(msg || "WS error");
+                    setErr(`OKX WS error: ${parsed.code ?? ""} ${parsed.msg ?? ""}`.trim() || "WS error");
                     return;
                 }
 
@@ -235,58 +250,88 @@ export default function Bot() {
                     setLast(candle);
 
                     setCandles((prev) => {
-                        if (prev.length > 0 && prev[prev.length - 1].ts === candle.ts) {
-                            const next = prev.slice(0, -1);
-                            next.push(candle);
-                            return next;
-                        }
-                        const next = [...prev, candle];
-                        if (next.length > 300) next.shift();
+                        const isSame = prev.length > 0 && prev[prev.length - 1].ts === candle.ts;
+                        const next = isSame ? [...prev.slice(0, -1), candle] : [...prev, candle];
+                        if (next.length > 400) next.shift();
                         return next;
                     });
 
-                    if (candle.confirm === "1") {
-                        onClosedCandle(candle);
-                    } else {
-                        setSim((prev) => ({ ...prev, equityUSDT: computeEquity(prev, candle.close) }));
+                    // Виконання pending на відкритті нової свічки
+                    const isNewBar = lastBarTsRef.current !== candle.ts;
+                    if (isNewBar && simRef.current?.pending) {
+                        const p = simRef.current.pending!;
+                        setSim((prev) => {
+                            let after = execAtOpen(prev, p.side, candle.open, candle.ts);
+                            after.pending = null;
+                            after.equityUSDT = computeEquity(after, candle.close);
+                            return after;
+                        });
                     }
+
+                    if (candle.confirm === "1") onClosedCandle(candle);
+                    else setSim((prev) => ({ ...prev, equityUSDT: computeEquity(prev, candle.close) }));
+
+                    lastBarTsRef.current = candle.ts; // оновлюємо тільки тут
                 }
             } catch (e) {
                 setErr(`Parse error: ${(e as Error).message}`);
             }
         });
 
-        ws.addEventListener("error", () => {
-            setStatus("error");
-            setErr("WebSocket error");
-        });
-
+        ws.addEventListener("error", () => { setStatus("error"); setErr("WebSocket error"); });
         ws.addEventListener("close", () => {
             setStatus("closed");
             if (reconnectTimer.current) window.clearTimeout(reconnectTimer.current);
             reconnectTimer.current = window.setTimeout(() => connect(), 2000) as unknown as number;
         });
-    }, [subscribeCandles, onClosedCandle]);
+    }, [arg.instId, arg.channel, onClosedCandle]);
 
-    // Перевірка instId → конект (на зміну інструмента або TF)
+    // Відновлення з локального стора / Mongo (опційно)
+    useEffect(() => {
+        (async () => {
+            if (simSnapshot) {
+                setSim(simSnapshot.sim);
+                setCandles(simSnapshot.candles || []);
+                if (simSnapshot.instId) setInstId(simSnapshot.instId);
+                if (simSnapshot.tf && ["1m", "5m", "15m"].includes(simSnapshot.tf)) setTf(simSnapshot.tf as TF);
+            } else {
+                try {
+                    const res = await fetch("/api/state", { cache: "no-store" });
+                    const doc = await res.json();
+                    if (doc?.sim) {
+                        setSim(doc.sim);
+                        setCandles(doc.candles || []);
+                        if (doc.instId) setInstId(doc.instId);
+                        if (doc.tf && ["1m", "5m", "15m"].includes(doc.tf)) setTf(doc.tf);
+                    }
+                } catch { }
+            }
+        })();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    // Перевірка instId → конект (ЛИШЕ при зміні інструмента/TF)
     useEffect(() => {
         let cancelled = false;
+
         (async () => {
             setStatus("checking"); setErr(null);
             const ok = await existsInstId(instId);
             if (cancelled) return;
+
             if (!ok) {
                 setStatus("idle");
                 setErr(`❌ ${instId} не знайдено для ${inferInstType(instId)}.`);
                 return;
             }
 
-            // reset симулятор і дані
+            // Разовий reset при зміні інструмента/TF
             setCandles([]); setLast(null); setPackets(0);
             setSim({
                 cashUSDT: 100, position: null, equityUSDT: 100, trades: [],
-                ema12: undefined, ema26: undefined, lastClosedTs: undefined,
+                ema12: undefined, ema26: undefined, lastClosedTs: undefined, pending: null,
             });
+            lastBarTsRef.current = null;
 
             connect();
         })();
@@ -298,36 +343,52 @@ export default function Bot() {
         };
     }, [instId, tf, connect]);
 
-    // Швидке перемикання без реконекту — якщо той самий сокет відкритий
-    const prevArgRef = useRef<OkxArg | null>(null);
-    useEffect(() => {
-        const prev = prevArgRef.current;
-        if (prev && (prev.instId !== arg.instId || prev.channel !== arg.channel)) {
-            unsubscribeCandles(prev);
-            setCandles([]); setLast(null); setPackets(0);
-            setSim({
-                cashUSDT: 100, position: null, equityUSDT: 100, trades: [],
-                ema12: undefined, ema26: undefined, lastClosedTs: undefined,
-            });
-            subscribeCandles();
-        }
-        prevArgRef.current = arg;
-    }, [arg, subscribeCandles, unsubscribeCandles]);
-
-    // EMA серії для графіка (на основі всіх свічок)
+    // EMA серії для графіка
     const { ema12Series, ema26Series } = useMemo(() => {
-        const e12: number[] = [];
-        const e26: number[] = [];
-        let p12: number | undefined;
-        let p26: number | undefined;
+        const e12: number[] = []; const e26: number[] = [];
+        let p12: number | undefined; let p26: number | undefined;
         for (const c of candles) {
             p12 = emaNext(p12, c.close, FAST);
             p26 = emaNext(p26, c.close, SLOW);
-            e12.push(p12);
-            e26.push(p26);
+            e12.push(p12); e26.push(p26);
         }
         return { ema12Series: e12, ema26Series: e26 };
     }, [candles]);
+
+    // Autosave у Zustand
+    useEffect(() => {
+        setSimSnapshot({
+            sim, instId, tf, candles: candles.slice(-400),
+            savedAt: new Date().toISOString(),
+        });
+    }, [sim, instId, tf, candles, setSimSnapshot]);
+
+    // Autosave у Mongo (кожні 10с)
+    useEffect(() => {
+        const id = window.setInterval(() => {
+            fetch("/api/state", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                    _id: "sim",
+                    instId, tf, sim,
+                    candles: candles.slice(-400),
+                    updatedAt: new Date().toISOString(),
+                }),
+            }).catch(console.error);
+        }, 10_000);
+        return () => clearInterval(id);
+    }, [instId, tf, sim, candles]);
+
+    // Відстеження нових угод → писати в Mongo
+    const tradesRef = useRef<number>(0);
+    useEffect(() => {
+        if (sim.trades.length > tradesRef.current) {
+            const newOnes = sim.trades.slice(tradesRef.current);
+            tradesRef.current = sim.trades.length;
+            newOnes.forEach((t) => saveTradeToDB({ ...t, instId, tf }));
+        }
+    }, [sim.trades, instId, tf]);
 
     const lastInfo = last
         ? `${dtFmt.format(new Date(last.ts))}  O:${nf2.format(last.open)}  H:${nf2.format(last.high)}  L:${nf2.format(last.low)}  C:${nf2.format(last.close)}  (${last.confirm === "1" ? "closed" : "live"})`
@@ -341,9 +402,8 @@ export default function Bot() {
         return net - cost;
     }, [sim.position, last]);
 
-    /* ================= Render ================= */
     return (
-        <div className="rounded-2xl m-6 bg-white/70 backdrop-blur p-4 shadow-soft">
+        <div className="rounded-2xl bg-white/70 backdrop-blur p-4 my-8 shadow-soft">
             {/* статус / інструмент / TF */}
             <div className="flex flex-wrap items-center gap-3">
                 <span className="text-sm px-2 py-1 rounded bg-slate-900/80 text-white">WS: {status}</span>
@@ -431,7 +491,8 @@ export default function Bot() {
             <div className="mt-3 rounded-lg bg-white/60 p-3 text-xs text-slate-700">
                 EMA12: <span className="font-mono">{sim.ema12 ? nf2.format(sim.ema12) : "—"}</span>&nbsp; |&nbsp;
                 EMA26: <span className="font-mono">{sim.ema26 ? nf2.format(sim.ema26) : "—"}</span>&nbsp; |&nbsp;
-                Fee: <span className="font-mono">{(FEE_RATE * 100).toFixed(2)}%</span>
+                Fee: <span className="font-mono">{(FEE_RATE * 100).toFixed(2)}%</span>&nbsp; |&nbsp;
+                Slippage: <span className="font-mono">{(SLIPPAGE * 100).toFixed(3)}%</span>
             </div>
 
             {/* історія угод */}
