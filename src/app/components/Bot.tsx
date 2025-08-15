@@ -1,9 +1,13 @@
-// src/components/Bot.tsx
+
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import CandlesChart, { Candle as ChartCandle, Trade as ChartTrade } from "@/app/components/CandlesChart";
 import { useTraderStore } from "@/store/trader";
+import { getClientId } from "@/lib/clientId";
+import { fetchTrades } from "@/lib/api";
+
+
 
 /* ================= Types & consts ================= */
 type InstType = "SPOT" | "SWAP" | "FUTURES";
@@ -23,6 +27,12 @@ const nf2 = new Intl.NumberFormat("en-US", { maximumFractionDigits: 8 });
 const nf4 = new Intl.NumberFormat("en-US", { maximumFractionDigits: 4 });
 const dtFmt = new Intl.DateTimeFormat("uk-UA", { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 
+type Settings = {
+    emaFast: number; emaSlow: number; takeProfit: number; stopLoss: number; feeRate: number; slippage: number; maxBars: number;
+};
+
+
+
 /* ================= Utils ================= */
 function inferInstType(id: string): InstType {
     if (id.endsWith("-SWAP")) return "SWAP";
@@ -41,6 +51,29 @@ async function existsInstId(id: string) {
         return false;
     }
 }
+
+function mergeTrades(local: ChartTrade[], fromDb: any[]): ChartTrade[] {
+    // DB → у наш внутрішній формат
+    const mapped: ChartTrade[] = fromDb.map((t) => ({
+        side: t.side,
+        price: Number(t.price),
+        qty: Number(t.qty),
+        ts: Number(t.ts),
+        pnlUSDT: t.pnlUSDT !== undefined ? Number(t.pnlUSDT) : undefined,
+    }));
+    // з’єднуємо та прибираємо дублікати по (side, ts, price, qty)
+    const key = (x: ChartTrade) => `${x.side}|${x.ts}|${x.price}|${x.qty}`;
+    const seen = new Set<string>();
+    const out: ChartTrade[] = [];
+    [...local, ...mapped].forEach((t) => {
+        const k = key(t);
+        if (!seen.has(k)) { seen.add(k); out.push(t); }
+    });
+    // відсортуємо за часом
+    out.sort((a, b) => a.ts - b.ts);
+    return out;
+}
+
 
 // OKX row: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
 function parseCandleRow(row: string[]): Candle | null {
@@ -82,11 +115,12 @@ type SimState = {
     pending?: PendingOrder;
 };
 
-const FAST = 12, SLOW = 26;
-const TAKE_PROFIT = 0.04; // +4%
-const STOP_LOSS = 0.02; // -2%
+// const FAST = 12, SLOW = 26;
+// const TAKE_PROFIT = 0.04; // +4%
+// const STOP_LOSS = 0.02; // -2%
 const FEE_RATE = 0.001; // 0.1%
 const SLIPPAGE = 0.0005; // 0.05%
+
 
 function computeEquity(state: SimState, mark: number): number {
     if (!state.position) return state.cashUSDT;
@@ -167,9 +201,117 @@ export default function Bot() {
         lastClosedTs: undefined,
         pending: null,
     }));
+    const [isLeader, setIsLeader] = useState(false);
+    const [settings, setSettings] = useState<Settings>({
+        emaFast: 12, emaSlow: 26, takeProfit: 0.04, stopLoss: 0.02, feeRate: 0.001, slippage: 0.0005, maxBars: 400
+    });
+    const clientIdRef = useRef<string>("");
+
+    const FAST = settings.emaFast;
+    const SLOW = settings.emaSlow;
+    const TAKE_PROFIT = settings.takeProfit;
+    const STOP_LOSS = settings.stopLoss;
+    const FEE_RATE = settings.feeRate;
+    const SLIPPAGE = settings.slippage;
+    const MAX_BARS = settings.maxBars;
 
     // Zustand local persist
     const { simSnapshot, setSimSnapshot } = useTraderStore();
+
+
+    // завантаження налаштувань і clientId
+
+    useEffect(() => {
+        if (isLeader) return; // лідер сам пише, йому pull не потрібен
+        const id = setInterval(async () => {
+            try {
+                const [rState, rTrades] = await Promise.all([
+                    fetch("/api/state", { cache: "no-store" }),
+                    fetch("/api/trades?since=" + new Date(Date.now() - 3600 * 1000).toISOString(), { cache: "no-store" }),
+                ]);
+                const doc = await rState.json();
+                if (doc?.sim) {
+                    setSim(doc.sim);
+                    setCandles(doc.candles || []);
+                    if (doc.instId) setInstId(doc.instId);
+                    if (doc.tf && ["1m", "5m", "15m"].includes(doc.tf)) setTf(doc.tf);
+                }
+
+                // trades не обов'язково зливати в локальний sim, ми їх уже малюємо з sim.trades;
+                // якщо хочеш таблицю з БД — зробимо окремий компонент /history.
+            } catch { }
+
+            // 3) Історія трейдів із Mongo (останні 2000, order=asc)
+            try {
+                const rows = await fetchTrades({ limit: 2000, order: "asc" });
+                setSim(prev => ({ ...prev, trades: mergeTrades(prev.trades, rows) }));
+            } catch (e) {
+                console.warn("fetchTrades initial failed:", e);
+            }
+
+
+        }, 20_000);
+        return () => clearInterval(id);
+
+    }, [isLeader]);
+
+    useEffect(() => {
+        if (isLeader) return; // лідер сам пише трейди, йому pull не треба
+        let stop = false;
+
+        async function pullNew() {
+            try {
+                // візьмемо останні від 15 хвилин — надійно й небагато
+                const sinceIso = new Date(Date.now() - 15 * 60 * 1000).toISOString();
+                const rows = await fetchTrades({ since: sinceIso, order: "asc", limit: 2000 });
+                if (!stop && rows?.length) {
+                    setSim(prev => ({ ...prev, trades: mergeTrades(prev.trades, rows) }));
+                }
+            } catch { }
+        }
+
+        pullNew();
+        const id = setInterval(pullNew, 20_000);
+        return () => { stop = true; clearInterval(id); };
+    }, [isLeader, setSim]);
+
+
+
+    useEffect(() => {
+        clientIdRef.current = getClientId();
+        (async () => {
+            try {
+                const r = await fetch("/api/settings", { cache: "no-store" });
+                const s = await r.json();
+                setSettings(s);
+                // можеш також підставити їх у локальні константи, якщо тримаєш окремо FAST/SLOW/TP/SL/fee/slippage
+            } catch { }
+        })();
+    }, []);
+
+    // аутсорс
+
+    useEffect(() => {
+        let stop = false;
+        async function renewLease() {
+            try {
+                const res = await fetch("/api/lease", {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ holderId: clientIdRef.current }),
+                });
+                const data = await res.json();
+                if (!stop) setIsLeader(Boolean(data.acquired));
+            } catch {
+                if (!stop) setIsLeader(false);
+            }
+        }
+        renewLease();
+        const id = setInterval(renewLease, 30_000);
+        return () => { stop = true; clearInterval(id); };
+    }, []);
+
+
 
     // refs
     const simRef = useRef(sim);
@@ -205,14 +347,16 @@ export default function Bot() {
 
             // формуємо pending на наступну свічку
 
-            if (!next.position && wasAbove === false && isAbove === true) {
-                console.log("[SIGNAL] BUY on close", new Date(c.ts).toISOString(), c.close);
-                next.pending = { side: "BUY", forTs: c.ts };
-            } else if (next.position && wasAbove === true && isAbove === false) {
-                console.log("[SIGNAL] SELL on close", new Date(c.ts).toISOString(), c.close);
-                next.pending = { side: "SELL", forTs: c.ts };
+            if (isLeader) {
+                // формуємо pending...
+                if (!next.position && wasAbove === false && isAbove === true) {
+                    console.log("[SIGNAL] BUY on close", new Date(c.ts).toISOString(), c.close);
+                    next.pending = { side: "BUY", forTs: c.ts };
+                } else if (next.position && wasAbove === true && isAbove === false) {
+                    console.log("[SIGNAL] SELL on close", new Date(c.ts).toISOString(), c.close);
+                    next.pending = { side: "SELL", forTs: c.ts };
+                }
             }
-
 
             next.equityUSDT = computeEquity(next, c.close);
             return next;
@@ -256,13 +400,13 @@ export default function Bot() {
                     setCandles((prev) => {
                         const isSame = prev.length > 0 && prev[prev.length - 1].ts === candle.ts;
                         const next = isSame ? [...prev.slice(0, -1), candle] : [...prev, candle];
-                        if (next.length > 400) next.shift();
+                        if (next.length > MAX_BARS) next.shift();
                         return next;
                     });
 
                     // Виконання pending на відкритті нової свічки
                     const isNewBar = lastBarTsRef.current !== candle.ts;
-                    if (isNewBar && simRef.current?.pending) {
+                    if (isNewBar && isLeader && simRef.current?.pending) {
                         const p = simRef.current.pending!;
                         console.log("[EXEC] at next open", p.side, new Date(candle.ts).toISOString(), "open:", candle.open);
 
@@ -339,23 +483,20 @@ export default function Bot() {
             lastBarTsRef.current = null;
 
             // Warmup історією (одноразово)
+
             try {
-                const bar = tf === "1m" ? "1m" : tf; // 1m/5m/15m
-                const url = `https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=${bar}&limit=150`;
+                const bar = tf; // "1m"|"5m"|"15m"
+                const url = `https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=${bar}&limit=${Math.max(150, settings.emaSlow * 6)}`;
                 const res = await fetch(url, { cache: "no-store" });
                 const json = await res.json();
                 const rows: string[][] = Array.isArray(json.data) ? json.data : [];
-                // OKX повертає від нових до старих — реверсимо
                 const warm = rows.slice().reverse().map(r => parseCandleRow(r)).filter(Boolean) as Candle[];
-                // Підкинемо в state та перерахуймо EMA-серії
-                setCandles(warm.slice(-400));
-                if (warm.length) {
-                    const lastC = warm[warm.length - 1];
-                    setLast(lastC);
-                }
+                setCandles(warm.slice(-settings.maxBars));
+                if (warm.length) setLast(warm[warm.length - 1]);
             } catch (e) {
                 console.warn("Warmup failed:", e);
             }
+
 
 
             connect();
@@ -383,7 +524,7 @@ export default function Bot() {
     // Autosave у Zustand
     useEffect(() => {
         setSimSnapshot({
-            sim, instId, tf, candles: candles.slice(-400),
+            sim, instId, tf, candles: candles.slice(-settings.maxBars),
             savedAt: new Date().toISOString(),
         });
     }, [sim, instId, tf, candles, setSimSnapshot]);
@@ -397,7 +538,7 @@ export default function Bot() {
                 body: JSON.stringify({
                     _id: "sim",
                     instId, tf, sim,
-                    candles: candles.slice(-400),
+                    candles: candles.slice(-settings.maxBars),
                     updatedAt: new Date().toISOString(),
                 }),
             }).catch(console.error);
