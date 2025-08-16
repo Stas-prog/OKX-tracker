@@ -1,4 +1,3 @@
-
 "use client";
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -6,8 +5,6 @@ import CandlesChart, { Candle as ChartCandle, Trade as ChartTrade } from "@/app/
 import { useTraderStore } from "@/store/trader";
 import { getClientId } from "@/lib/clientId";
 import { fetchTrades } from "@/lib/api";
-
-
 
 /* ================= Types & consts ================= */
 type InstType = "SPOT" | "SWAP" | "FUTURES";
@@ -31,8 +28,6 @@ type Settings = {
     emaFast: number; emaSlow: number; takeProfit: number; stopLoss: number; feeRate: number; slippage: number; maxBars: number;
 };
 
-
-
 /* ================= Utils ================= */
 function inferInstType(id: string): InstType {
     if (id.endsWith("-SWAP")) return "SWAP";
@@ -52,16 +47,17 @@ async function existsInstId(id: string) {
     }
 }
 
-function mergeTrades(local: ChartTrade[], fromDb: any[]): ChartTrade[] {
-    // DB → у наш внутрішній формат
-    const mapped: ChartTrade[] = fromDb.map((t) => ({
+// <<<<<< БЕЗПЕЧНИЙ MERGE (ГАРДИ ПРОТИ НЕ-МАСИВІВ)
+function mergeTrades(local: ChartTrade[], fromDb: any): ChartTrade[] {
+    const rows: any[] = Array.isArray(fromDb) ? fromDb : (Array.isArray(fromDb?.items) ? fromDb.items : []);
+    const mapped: ChartTrade[] = rows.map((t) => ({
         side: t.side,
         price: Number(t.price),
         qty: Number(t.qty),
         ts: Number(t.ts),
         pnlUSDT: t.pnlUSDT !== undefined ? Number(t.pnlUSDT) : undefined,
     }));
-    // з’єднуємо та прибираємо дублікати по (side, ts, price, qty)
+
     const key = (x: ChartTrade) => `${x.side}|${x.ts}|${x.price}|${x.qty}`;
     const seen = new Set<string>();
     const out: ChartTrade[] = [];
@@ -69,11 +65,9 @@ function mergeTrades(local: ChartTrade[], fromDb: any[]): ChartTrade[] {
         const k = key(t);
         if (!seen.has(k)) { seen.add(k); out.push(t); }
     });
-    // відсортуємо за часом
     out.sort((a, b) => a.ts - b.ts);
     return out;
 }
-
 
 // OKX row: [ts, o, h, l, c, vol, volCcy, volCcyQuote, confirm]
 function parseCandleRow(row: string[]): Candle | null {
@@ -115,12 +109,8 @@ type SimState = {
     pending?: PendingOrder;
 };
 
-// const FAST = 12, SLOW = 26;
-// const TAKE_PROFIT = 0.04; // +4%
-// const STOP_LOSS = 0.02; // -2%
-const FEE_RATE = 0.001; // 0.1%
-const SLIPPAGE = 0.0005; // 0.05%
-
+const FEE_RATE = 0.001;
+const SLIPPAGE = 0.0005;
 
 function computeEquity(state: SimState, mark: number): number {
     if (!state.position) return state.cashUSDT;
@@ -141,7 +131,7 @@ async function saveTradeToDB(t: Trade & { instId: string; tf: string }) {
 
 function tryEnter(state: SimState, price: number, ts: number): SimState {
     if (state.position || state.cashUSDT <= 0) return state;
-    const qty = (state.cashUSDT * (1 - FEE_RATE)) / price; // fee на купівлі
+    const qty = (state.cashUSDT * (1 - FEE_RATE)) / price;
     const pos: Position = { entry: price, qty, entryTs: ts };
     const buy: Trade = { side: "BUY", price, qty, ts };
     const next: SimState = {
@@ -158,7 +148,7 @@ function tryExit(state: SimState, price: number, ts: number): SimState {
     if (!state.position) return state;
     const { qty, entry } = state.position;
     const grossProceeds = qty * price;
-    const netProceeds = grossProceeds * (1 - FEE_RATE); // fee на продажу
+    const netProceeds = grossProceeds * (1 - FEE_RATE);
     const cost = qty * entry;
     const pnl = netProceeds - cost;
 
@@ -215,7 +205,6 @@ export default function Bot() {
     const SLIPPAGE = settings.slippage;
     const MAX_BARS = settings.maxBars;
 
-    // Zustand local persist
     const { simSnapshot, setSimSnapshot } = useTraderStore();
 
 
@@ -704,3 +693,4 @@ export default function Bot() {
 function nf6(x: number) {
     return (Math.round(x * 1e6) / 1e6).toFixed(6);
 }
+

@@ -3,19 +3,22 @@ export const runtime = "nodejs";
 export const revalidate = 0;
 
 import { NextResponse } from "next/server";
-import { getTradeHistory } from "@/utils/virtualTrader";
+import { getTradeHistory } from "@/lib/trade-log";
 
-// GET /api/trade-history?limit=200&instId=BTC-USDT
+// GET /api/trade-history?limit=100&since=ISO&before=ISO&order=asc|desc
 export async function GET(req: Request) {
     const url = new URL(req.url);
-    const limit = Math.min(parseInt(url.searchParams.get("limit") || "100", 10) || 100, 2000);
-    const instId = url.searchParams.get("instId") || undefined;
+    const limit = url.searchParams.get("limit") ?? undefined;
+    const since = url.searchParams.get("since") ?? undefined;
+    const before = url.searchParams.get("before") ?? undefined;
+    const order = (url.searchParams.get("order") as "asc" | "desc") ?? "desc";
 
-    try {
-        const rows = await getTradeHistory(limit, instId);
-        return NextResponse.json(rows);
-    } catch (e) {
-        console.error("trade-history error:", e);
-        return NextResponse.json({ error: "trade-history failed" }, { status: 500 });
-    }
+    const items = await getTradeHistory({
+        limit: limit ? Math.max(1, Math.min(2000, parseInt(limit, 10))) : undefined,
+        since: since || undefined,
+        before: before || undefined,
+        order,
+    });
+
+    return NextResponse.json(items);
 }
