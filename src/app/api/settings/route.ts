@@ -19,15 +19,16 @@ type SettingsDoc = {
 
 const DEFAULTS: SettingsDoc = {
     _id: "bot-settings",
-    emaFast: 12,
-    emaSlow: 26,
-    takeProfit: 0.04,
-    stopLoss: 0.02,
+    emaFast: 8,          // було 12
+    emaSlow: 21,         // було 26
+    takeProfit: 0.006,   // 0.6% (було 4%)
+    stopLoss: 0.004,     // 0.4% (було 2%)
     feeRate: 0.001,
     slippage: 0.0005,
-    maxBars: 400,
+    maxBars: 600,        // трохи довше тримаємо історію
     updatedAt: new Date().toISOString(),
 };
+
 
 export async function GET() {
     const db = await getDb();
