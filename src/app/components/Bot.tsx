@@ -6,16 +6,13 @@ import { useTraderStore } from "@/store/trader";
 import { getClientId } from "@/lib/clientId";
 import { fetchTrades } from "@/lib/api";
 import { nf2, nf4, nf6, dtFmt } from "@/lib/nf";
+import { OkxWs } from "@/lib/okxWs";
 
 /* ================= Types & consts ================= */
 type InstType = "SPOT" | "SWAP" | "FUTURES";
 type OkxArg = { channel: string; instId: string };
 type OkxCandleMsg = { arg: OkxArg; data: string[][] };
-type OkxEvent =
-    | { event: "subscribe" | "unsubscribe" | "error" | "pong"; code?: string; msg?: string; arg?: OkxArg }
-    | Record<string, unknown>;
 
-const WS_URL = "wss://ws.okx.com:8443/ws/v5/business";
 const TF_MAP = { "1m": "candle1m", "5m": "candle5m", "15m": "candle15m" } as const;
 type TF = keyof typeof TF_MAP;
 
@@ -120,11 +117,12 @@ type SimState = {
 };
 
 const DEFAULT_CASH = 100;
-const MAX_HOLD_MIN = 45;
+const MAX_HOLD_MIN = 45; // (для майбутніх логік, якщо треба)
 const COOLDOWN_BARS = 2;
 
 /* ================= Component ================= */
 export default function Bot() {
+    // ---- UI/State
     const [instId, setInstId] = useState<string>("BTC-USDT");
     const [tf, setTf] = useState<TF>("1m");
 
@@ -175,7 +173,7 @@ export default function Bot() {
     const SLIPPAGE = settings.slippage;
     const MAX_BARS = settings.maxBars;
 
-    // Zustand
+    // Zustand persist
     const { simSnapshot, setSimSnapshot } = useTraderStore();
 
     // clientId + settings
@@ -221,14 +219,112 @@ export default function Bot() {
     }, [sim]);
     const lastBarTsRef = useRef<number | null>(null);
 
-    const channel = TF_MAP[tf];
-    const wsRef = useRef<WebSocket | null>(null);
-    const heartbeatIdRef = useRef<number | null>(null);
-    const watchdogIdRef = useRef<number | null>(null);
-    const reconnectTimerRef = useRef<number | null>(null);
-    const reconnectDelayRef = useRef<number>(2000); // backoff start
-    const manualCloseRef = useRef<boolean>(false);
-    const subKeyRef = useRef<string>("");
+    // ===== onClosedCandle (EMA, сигнали, стоп/тейк) =====
+    const onClosedCandle = useCallback(
+        (c: Candle) => {
+            setSim((prev) => {
+                if (prev.lastClosedTs === c.ts) return prev;
+
+                const emaFast = emaNext(prev.emaFast, c.close, settingsRef.current.emaFast);
+                const emaSlow = emaNext(prev.emaSlow, c.close, settingsRef.current.emaSlow);
+
+                let next: SimState = { ...prev, emaFast, emaSlow, lastClosedTs: c.ts };
+
+                // стоп/тейк
+                if (next.position) {
+                    const pnlPct = (c.close - next.position.entry) / next.position.entry;
+                    if (pnlPct >= settingsRef.current.takeProfit || pnlPct <= -settingsRef.current.stopLoss) {
+                        next = tryExit(next, c.close, c.ts);
+                        next.cooldownUntilTs = c.ts + COOLDOWN_BARS * 60 * 1000;
+                        next.lastTradeTs = c.ts;
+                    }
+                }
+
+                // перетин ліній → pending (лише лідер)
+                if (isLeader) {
+                    const wasAbove =
+                        prev.emaFast !== undefined && prev.emaSlow !== undefined && prev.emaFast > prev.emaSlow;
+                    const isAbove = emaFast > emaSlow;
+                    const inCooldown = !!prev.cooldownUntilTs && c.ts < prev.cooldownUntilTs;
+
+                    if (!inCooldown) {
+                        if (!next.position && wasAbove === false && isAbove === true) {
+                            next.pending = { side: "BUY", forTs: c.ts };
+                        } else if (next.position && wasAbove === true && isAbove === false) {
+                            next.pending = { side: "SELL", forTs: c.ts };
+                        }
+                    }
+                }
+
+                next.equityUSDT = computeEquity(next, c.close);
+                return next;
+            });
+        },
+        [isLeader]
+    );
+
+    // ===== Helpers =====
+    function computeEquity(state: SimState, mark: number): number {
+        if (!state.position) return state.cashUSDT;
+        return state.cashUSDT + state.position.qty * mark;
+    }
+
+    async function saveTradeToDB(t: Trade & { instId: string; tf: string }) {
+        await fetch("/api/trades", {
+            method: "POST",
+            headers: { "content-type": "application/json" },
+            body: JSON.stringify({ ...t, createdAt: new Date().toISOString() }),
+        }).catch(() => { });
+    }
+
+    function tryEnter(state: SimState, price: number, ts: number): SimState {
+        if (state.position || state.cashUSDT <= 0) return state;
+        const qty = (state.cashUSDT * (1 - settingsRef.current.feeRate)) / price;
+        const pos: Position = { entry: price, qty, entryTs: ts };
+        const buy: Trade = { side: "BUY", price, qty, ts };
+        const next: SimState = {
+            ...state,
+            cashUSDT: 0,
+            position: pos,
+            trades: [...state.trades, buy],
+            lastTradeTs: ts,
+            enteredAtTs: ts,
+        };
+        next.equityUSDT = computeEquity(next, price);
+        return next;
+    }
+
+    function tryExit(state: SimState, price: number, ts: number): SimState {
+        if (!state.position) return state;
+        const { qty, entry } = state.position;
+        const grossProceeds = qty * price;
+        const netProceeds = grossProceeds * (1 - settingsRef.current.feeRate);
+        const cost = qty * entry;
+        const pnl = netProceeds - cost;
+
+        const sell: Trade = { side: "SELL", price, qty, ts, pnlUSDT: pnl };
+        const cash = state.cashUSDT + netProceeds;
+        const next: SimState = {
+            ...state,
+            cashUSDT: cash,
+            position: null,
+            trades: [...state.trades, sell],
+            lastTradeTs: ts,
+            cooldownUntilTs: ts + COOLDOWN_BARS * 60 * 1000,
+            enteredAtTs: undefined,
+        };
+        next.equityUSDT = computeEquity(next, price);
+        return next;
+    }
+
+    function execAtOpen(next: SimState, side: "BUY" | "SELL", open: number, ts: number): SimState {
+        const px =
+            side === "BUY" ? open * (1 + settingsRef.current.slippage) : open * (1 - settingsRef.current.slippage);
+        return side === "BUY" ? tryEnter(next, px, ts) : tryExit(next, px, ts);
+    }
+
+    /* ================== WS via OkxWs ================== */
+    const wsClientRef = useRef<OkxWs | null>(null);
 
     // Відновлення з local/Mongo
     useEffect(() => {
@@ -305,273 +401,25 @@ export default function Bot() {
         };
     }, [isLeader]);
 
-    // Обробка закритої свічки
-    const onClosedCandle = useCallback(
-        (c: Candle) => {
-            setSim((prev) => {
-                if (prev.lastClosedTs === c.ts) return prev;
-
-                const emaFast = emaNext(prev.emaFast, c.close, settingsRef.current.emaFast);
-                const emaSlow = emaNext(prev.emaSlow, c.close, settingsRef.current.emaSlow);
-
-                let next: SimState = { ...prev, emaFast, emaSlow, lastClosedTs: c.ts };
-
-                // стоп/тейк
-                if (next.position) {
-                    const pnlPct = (c.close - next.position.entry) / next.position.entry;
-                    if (pnlPct >= settingsRef.current.takeProfit || pnlPct <= -settingsRef.current.stopLoss) {
-                        next = tryExit(next, c.close, c.ts);
-                        next.cooldownUntilTs = c.ts + COOLDOWN_BARS * 60 * 1000;
-                        next.lastTradeTs = c.ts;
-                    }
-                }
-
-                // перетин ліній → pending (лише лідер)
-                if (isLeader) {
-                    const wasAbove =
-                        prev.emaFast !== undefined && prev.emaSlow !== undefined && prev.emaFast > prev.emaSlow;
-                    const isAbove = emaFast > emaSlow;
-                    const inCooldown = !!prev.cooldownUntilTs && c.ts < prev.cooldownUntilTs;
-
-                    if (!inCooldown) {
-                        if (!next.position && wasAbove === false && isAbove === true) {
-                            next.pending = { side: "BUY", forTs: c.ts };
-                        } else if (next.position && wasAbove === true && isAbove === false) {
-                            next.pending = { side: "SELL", forTs: c.ts };
-                        }
-                    }
-                }
-
-                next.equityUSDT = computeEquity(next, c.close);
-                return next;
-            });
-        },
-        [isLeader]
-    );
-
-    // ===== Helpers =====
-    function computeEquity(state: SimState, mark: number): number {
-        if (!state.position) return state.cashUSDT;
-        return state.cashUSDT + state.position.qty * mark;
-    }
-
-    async function saveTradeToDB(t: Trade & { instId: string; tf: string }) {
-        await fetch("/api/trades", {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({ ...t, createdAt: new Date().toISOString() }),
-        });
-    }
-
-    function tryEnter(state: SimState, price: number, ts: number): SimState {
-        if (state.position || state.cashUSDT <= 0) return state;
-        const qty = (state.cashUSDT * (1 - settingsRef.current.feeRate)) / price;
-        const pos: Position = { entry: price, qty, entryTs: ts };
-        const buy: Trade = { side: "BUY", price, qty, ts };
-        const next: SimState = {
-            ...state,
-            cashUSDT: 0,
-            position: pos,
-            trades: [...state.trades, buy],
-            lastTradeTs: ts,
-            enteredAtTs: ts,
-        };
-        next.equityUSDT = computeEquity(next, price);
-        return next;
-    }
-
-    function tryExit(state: SimState, price: number, ts: number): SimState {
-        if (!state.position) return state;
-        const { qty, entry } = state.position;
-        const grossProceeds = qty * price;
-        const netProceeds = grossProceeds * (1 - settingsRef.current.feeRate);
-        const cost = qty * entry;
-        const pnl = netProceeds - cost;
-
-        const sell: Trade = { side: "SELL", price, qty, ts, pnlUSDT: pnl };
-        const cash = state.cashUSDT + netProceeds;
-        const next: SimState = {
-            ...state,
-            cashUSDT: cash,
-            position: null,
-            trades: [...state.trades, sell],
-            lastTradeTs: ts,
-            cooldownUntilTs: ts + COOLDOWN_BARS * 60 * 1000,
-            enteredAtTs: undefined,
-        };
-        next.equityUSDT = computeEquity(next, price);
-        return next;
-    }
-
-    function execAtOpen(next: SimState, side: "BUY" | "SELL", open: number, ts: number): SimState {
-        const px =
-            side === "BUY" ? open * (1 + settingsRef.current.slippage) : open * (1 - settingsRef.current.slippage);
-        return side === "BUY" ? tryEnter(next, px, ts) : tryExit(next, px, ts);
-    }
-
-    // ==== WS stability helpers ====
-    const clearTimers = () => {
-        if (heartbeatIdRef.current) {
-            window.clearInterval(heartbeatIdRef.current);
-            heartbeatIdRef.current = null;
-        }
-        if (watchdogIdRef.current) {
-            window.clearTimeout(watchdogIdRef.current);
-            watchdogIdRef.current = null;
-        }
-        if (reconnectTimerRef.current) {
-            window.clearTimeout(reconnectTimerRef.current);
-            reconnectTimerRef.current = null;
-        }
-    };
-
-    const scheduleWatchdog = () => {
-        if (watchdogIdRef.current) window.clearTimeout(watchdogIdRef.current);
-        watchdogIdRef.current = window.setTimeout(() => {
-            // 60с тиші → форс reconnect
-            try {
-                wsRef.current?.close();
-            } catch { }
-        }, 60_000) as unknown as number;
-    };
-
-    // Конект (залежить ТІЛЬКИ від instId, tf)
+    // Конект WS, warmup історією, підписка на свічки
     const connect = useCallback(() => {
-        // унеможливити дубль
-        manualCloseRef.current = false;
-        clearTimers();
+        // закриємо попередній клієнт
+        wsClientRef.current?.close();
+        wsClientRef.current = null;
 
-        // закрити попередній
-        if (wsRef.current) {
-            try {
-                manualCloseRef.current = true;
-                wsRef.current.close();
-            } catch { }
-            wsRef.current = null;
-        }
-
-        setStatus("connecting");
+        setStatus("checking");
         setErr(null);
 
-        const ws = new WebSocket(WS_URL);
-        wsRef.current = ws;
-
-        const myKey = `${instId}|${tf}`;
-        subKeyRef.current = myKey;
-
-        ws.addEventListener("open", () => {
-            // підписка
-            if (subKeyRef.current !== myKey) return; // застраховка від гонки
-            setStatus("open");
-            reconnectDelayRef.current = 2000; // скинути backoff
-            ws.send(JSON.stringify({ op: "subscribe", args: [{ channel: TF_MAP[tf], instId }] }));
-
-            // keep-alive ping
-            heartbeatIdRef.current = window.setInterval(() => {
-                try {
-                    ws.send(JSON.stringify({ op: "ping" }));
-                } catch { }
-            }, 20_000) as unknown as number;
-
-            scheduleWatchdog();
-        });
-
-        ws.addEventListener("message", (evt) => {
-            try {
-                const parsed = JSON.parse(String(evt.data)) as OkxEvent | OkxCandleMsg;
-
-                // відповіді на ping/pong
-                if ("event" in parsed && parsed.event === "pong") {
-                    return;
-                }
-                if ("event" in parsed && parsed.event === "error") {
-                    setErr(`OKX WS error: ${parsed.code ?? ""} ${parsed.msg ?? ""}`.trim() || "WS error");
-                    return;
-                }
-                // рухаємо watchdog при будь-якому валідному повідомленні
-                scheduleWatchdog();
-
-                if ("arg" in parsed && "data" in parsed && Array.isArray(parsed.data)) {
-                    const rows = parsed.data as string[][];
-                    const row = rows[rows.length - 1];
-                    const candle = parseCandleRow(row);
-                    if (!candle) return;
-
-                    setPackets((n) => n + 1);
-                    setLast(candle);
-
-                    setCandles((prev) => {
-                        const isSame = prev.length > 0 && prev[prev.length - 1].ts === candle.ts;
-                        const next = isSame ? [...prev.slice(0, -1), candle] : [...prev, candle];
-                        if (next.length > MAX_BARS) next.shift();
-                        return next;
-                    });
-
-                    const isNewBar = lastBarTsRef.current !== candle.ts;
-                    if (isNewBar && isLeader && simRef.current?.pending) {
-                        const p = simRef.current.pending!;
-                        setSim((prev) => {
-                            let after = execAtOpen(prev, p.side, candle.open, candle.ts);
-                            after.pending = null;
-                            after.equityUSDT = computeEquity(after, candle.close);
-                            after.lastTradeTs = candle.ts;
-                            after.enteredAtTs = p.side === "BUY" ? candle.ts : undefined;
-                            return after;
-                        });
-                    }
-
-                    if (candle.confirm === "1") onClosedCandle(candle);
-                    else setSim((prev) => ({ ...prev, equityUSDT: computeEquity(prev, candle.close) }));
-
-                    lastBarTsRef.current = candle.ts;
-                }
-            } catch (e) {
-                setErr(`Parse error: ${(e as Error).message}`);
-            }
-        });
-
-        ws.addEventListener("error", () => {
-            setStatus("error");
-            // помилка — нехай закриється, а далі спрацює close
-        });
-
-        ws.addEventListener("close", () => {
-            setStatus("closed");
-            clearTimers();
-
-            // якщо ручне закриття/переключення інструмента — не reconnect
-            if (manualCloseRef.current) return;
-
-            // якщо ключ уже інший (швидка зміна інструмента) — не reconnect цієї сесії
-            if (subKeyRef.current !== myKey) return;
-
-            // backoff з лімітом 30с
-            const delay = Math.min(reconnectDelayRef.current, 30_000);
-            reconnectDelayRef.current = delay * 2;
-
-            reconnectTimerRef.current = window.setTimeout(() => {
-                if (navigator.onLine) connect();
-            }, delay) as unknown as number;
-        });
-    }, [instId, tf, isLeader, onClosedCandle, MAX_BARS]);
-
-    // Перевірка instId → warmup → connect
-    useEffect(() => {
-        let cancelled = false;
-
         (async () => {
-            setStatus("checking");
-            setErr(null);
+            // перевіримо існування інструмента
             const ok = await existsInstId(instId);
-            if (cancelled) return;
-
             if (!ok) {
                 setStatus("idle");
                 setErr(`❌ ${instId} не знайдено для ${inferInstType(instId)}.`);
                 return;
             }
 
-            // reset
+            // одноразовий reset при зміні інструмента/TF
             setCandles([]);
             setLast(null);
             setPackets(0);
@@ -590,9 +438,9 @@ export default function Bot() {
             });
             lastBarTsRef.current = null;
 
+            // warmup з REST
             try {
-                const bar = tf;
-                const url = `https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=${bar}&limit=${Math.max(
+                const url = `https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=${tf}&limit=${Math.max(
                     150,
                     settings.emaSlow * 6
                 )}`;
@@ -610,36 +458,68 @@ export default function Bot() {
                 console.warn("Warmup failed:", e);
             }
 
-            connect();
+            // стартуємо WS через OkxWs
+            setStatus("connecting");
+            const client = new OkxWs({
+                url: "wss://ws.okx.com:8443/ws/v5/business",
+                debug: false,
+                onErrorText: (txt) => setErr(txt),
+                onCandle: (json: OkxCandleMsg) => {
+                    const rows = json.data;
+                    const row = rows[rows.length - 1];
+                    const candle = parseCandleRow(row);
+                    if (!candle) return;
+
+                    setPackets((n) => n + 1);
+                    setLast(candle);
+
+                    setCandles((prev) => {
+                        const isSame = prev.length > 0 && prev[prev.length - 1].ts === candle.ts;
+                        const next = isSame ? [...prev.slice(0, -1), candle] : [...prev, candle];
+                        if (next.length > MAX_BARS) next.shift();
+                        return next;
+                    });
+
+                    // виконання pending на відкритті нової свічки
+                    const isNewBar = lastBarTsRef.current !== candle.ts;
+                    if (isNewBar && isLeader && simRef.current?.pending) {
+                        const p = simRef.current.pending!;
+                        setSim((prev) => {
+                            let after = execAtOpen(prev, p.side, candle.open, candle.ts);
+                            after.pending = null;
+                            after.equityUSDT = computeEquity(after, candle.close);
+                            after.lastTradeTs = candle.ts;
+                            after.enteredAtTs = p.side === "BUY" ? candle.ts : undefined;
+                            return after;
+                        });
+                    }
+
+                    if (candle.confirm === "1") onClosedCandle(candle);
+                    else setSim((prev) => ({ ...prev, equityUSDT: computeEquity(prev, candle.close) }));
+
+                    lastBarTsRef.current = candle.ts;
+                },
+                onAny: (json) => {
+                    // статус за подіями
+                    if ((json as any)?.event === "subscribe") setStatus("open");
+                    if ((json as any)?.event === "error") setStatus("error");
+                },
+            });
+
+            wsClientRef.current = client;
+            client.connect();
+            client.subscribe([{ channel: TF_MAP[tf], instId }]); // підписка на свічки
         })();
+    }, [instId, tf, settings.emaSlow, settings.maxBars, isLeader, onClosedCandle]);
 
+    // React на зміну instId/tf → connect
+    useEffect(() => {
+        connect();
         return () => {
-            cancelled = true;
-            manualCloseRef.current = true;
-            clearTimers();
-            if (wsRef.current) {
-                try {
-                    wsRef.current.close();
-                } catch { }
-                wsRef.current = null;
-            }
+            wsClientRef.current?.close();
+            wsClientRef.current = null;
         };
-    }, [instId, tf, connect, settings.maxBars, settings.emaSlow]);
-
-    // EMA серії
-    const { emaFastSeries, emaSlowSeries } = useMemo(() => {
-        const eF: number[] = [];
-        const eS: number[] = [];
-        let pF: number | undefined;
-        let pS: number | undefined;
-        for (const c of candles) {
-            pF = emaNext(pF, c.close, FAST);
-            pS = emaNext(pS, c.close, SLOW);
-            eF.push(pF);
-            eS.push(pS);
-        }
-        return { emaFastSeries: eF, emaSlowSeries: eS };
-    }, [candles, FAST, SLOW]);
+    }, [connect]);
 
     // Autosave → Zustand
     useEffect(() => {
@@ -679,20 +559,18 @@ export default function Bot() {
         if (sim.trades.length > tradesRef.current) {
             const newOnes = sim.trades.slice(tradesRef.current);
             tradesRef.current = sim.trades.length;
-            newOnes.forEach((t) => saveTradeToDB({ ...t, instId, tf }).catch((e) => console.error("saveTradeToDB", e)));
+            newOnes.forEach((t) => saveTradeToDB({ ...t, instId, tf }).catch(() => { }));
         }
     }, [sim.trades, instId, tf, isLeader]);
 
     // Online/offline — відновити конект
     useEffect(() => {
         const onOnline = () => {
-            if (wsRef.current?.readyState !== WebSocket.OPEN) connect();
+            // перепідписка при поверненні в онлайн
+            connect();
         };
         const onOffline = () => {
-            try {
-                manualCloseRef.current = true;
-                wsRef.current?.close();
-            } catch { }
+            wsClientRef.current?.close();
         };
         window.addEventListener("online", onOnline);
         window.addEventListener("offline", onOffline);
@@ -701,6 +579,21 @@ export default function Bot() {
             window.removeEventListener("offline", onOffline);
         };
     }, [connect]);
+
+    // EMA серії для графіка
+    const { emaFastSeries, emaSlowSeries } = useMemo(() => {
+        const eF: number[] = [];
+        const eS: number[] = [];
+        let pF: number | undefined;
+        let pS: number | undefined;
+        for (const c of candles) {
+            pF = emaNext(pF, c.close, FAST);
+            pS = emaNext(pS, c.close, SLOW);
+            eF.push(pF);
+            eS.push(pS);
+        }
+        return { emaFastSeries: eF, emaSlowSeries: eS };
+    }, [candles, FAST, SLOW]);
 
     const lastInfo = last
         ? `${dtFmt.format(new Date(last.ts))}  O:${nf2.format(last.open)}  H:${nf2.format(
@@ -738,7 +631,7 @@ export default function Bot() {
                         {/* SWAP (USDT) */}
                         <option>BTC-USDT-SWAP</option>
                         <option>ETH-USDT-SWAP</option>
-                        {/* SWАП (USD) */}
+                        {/* SWAP (USD) */}
                         <option>BTC-USD-SWAP</option>
                         <option>ETH-USD-SWAP</option>
                     </select>
