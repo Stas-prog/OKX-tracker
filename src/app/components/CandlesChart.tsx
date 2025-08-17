@@ -63,7 +63,7 @@ export default function CandlesChart({
         return series.map((v, i) => `${i === 0 ? "M" : "L"} ${i * xStep} ${y(v)}`).join(" ");
     }, [ema26, N, data.length, xStep, yMin, yMax, H, denom]);
 
-    // Зручна мапа ts->індекс для маркерів
+    // Зручна мапа ts->останній індекс для маркерів (якщо дублікати — беремо останній)
     const indexByTs = useMemo(() => {
         const m = new Map<number, number>();
         data.forEach((c, i) => m.set(c.ts, i));
@@ -85,7 +85,7 @@ export default function CandlesChart({
                 {/* Сітка */}
                 {Array.from({ length: 4 }).map((_, i) => {
                     const yy = (H / 4) * i;
-                    return <line key={i} x1={0} y1={yy} x2={W} y2={yy} stroke="rgba(0,0,0,0.08)" strokeWidth={1} />;
+                    return <line key={`grid-${i}`} x1={0} y1={yy} x2={W} y2={yy} stroke="rgba(0,0,0,0.08)" strokeWidth={1} />;
                 })}
 
                 {/* Свічки */}
@@ -99,8 +99,9 @@ export default function CandlesChart({
                     const bodyW = Math.max(2, Math.min(5, xStep * 0.6));
                     const color = isUp ? "rgba(34,197,94,0.9)" : "rgba(239,68,68,0.9)";
 
+                    // Ключ робимо стабільно унікальним: ts+індекс (бо ts може повторитись)
                     return (
-                        <g key={c.ts}>
+                        <g key={`c-${c.ts}-${i}`}>
                             <line x1={cx} y1={y(c.high)} x2={cx} y2={y(c.low)} stroke="rgba(0,0,0,0.35)" strokeWidth={1} />
                             <rect x={cx - bodyW / 2} y={top} width={bodyW} height={bodyH} rx={1.5} fill={color} />
                         </g>
@@ -121,11 +122,10 @@ export default function CandlesChart({
                     const cx = idx * xStep;
                     const cy = y(t.price);
                     const fill = t.side === "BUY" ? "rgba(34,197,94,0.95)" : "rgba(239,68,68,0.95)";
-                    // ромбик
                     const size = 5;
                     return (
                         <polygon
-                            key={i}
+                            key={`tr-${t.side}-${t.ts}-${i}`}
                             points={`${cx},${cy - size} ${cx + size},${cy} ${cx},${cy + size} ${cx - size},${cy}`}
                             fill={fill}
                             stroke="white"

@@ -6,6 +6,7 @@ import { useTraderStore } from "@/store/trader";
 import { getClientId } from "@/lib/clientId";
 import { fetchTrades } from "@/lib/api";
 import { nf2, nf4, nf6, dtFmt } from "@/lib/nf";
+import SettingsPanel from "@/app/components/SettingsPanel";
 import { OkxWs } from "@/lib/okxWs";
 
 /* ================= Types & consts ================= */
@@ -117,7 +118,6 @@ type SimState = {
 };
 
 const DEFAULT_CASH = 100;
-const MAX_HOLD_MIN = 45; // (для майбутніх логік, якщо треба)
 const COOLDOWN_BARS = 2;
 
 /* ================= Component ================= */
@@ -401,9 +401,8 @@ export default function Bot() {
         };
     }, [isLeader]);
 
-    // Конект WS, warmup історією, підписка на свічки
+    // Конект WS, warmup, підписка на свічки
     const connect = useCallback(() => {
-        // закриємо попередній клієнт
         wsClientRef.current?.close();
         wsClientRef.current = null;
 
@@ -411,7 +410,6 @@ export default function Bot() {
         setErr(null);
 
         (async () => {
-            // перевіримо існування інструмента
             const ok = await existsInstId(instId);
             if (!ok) {
                 setStatus("idle");
@@ -419,7 +417,7 @@ export default function Bot() {
                 return;
             }
 
-            // одноразовий reset при зміні інструмента/TF
+            // reset
             setCandles([]);
             setLast(null);
             setPackets(0);
@@ -438,7 +436,7 @@ export default function Bot() {
             });
             lastBarTsRef.current = null;
 
-            // warmup з REST
+            // warmup
             try {
                 const url = `https://www.okx.com/api/v5/market/candles?instId=${instId}&bar=${tf}&limit=${Math.max(
                     150,
@@ -458,7 +456,7 @@ export default function Bot() {
                 console.warn("Warmup failed:", e);
             }
 
-            // стартуємо WS через OkxWs
+            // WS
             setStatus("connecting");
             const client = new OkxWs({
                 url: "wss://ws.okx.com:8443/ws/v5/business",
@@ -500,7 +498,6 @@ export default function Bot() {
                     lastBarTsRef.current = candle.ts;
                 },
                 onAny: (json) => {
-                    // статус за подіями
                     if ((json as any)?.event === "subscribe") setStatus("open");
                     if ((json as any)?.event === "error") setStatus("error");
                 },
@@ -508,7 +505,7 @@ export default function Bot() {
 
             wsClientRef.current = client;
             client.connect();
-            client.subscribe([{ channel: TF_MAP[tf], instId }]); // підписка на свічки
+            client.subscribe([{ channel: TF_MAP[tf], instId }]);
         })();
     }, [instId, tf, settings.emaSlow, settings.maxBars, isLeader, onClosedCandle]);
 
@@ -565,13 +562,8 @@ export default function Bot() {
 
     // Online/offline — відновити конект
     useEffect(() => {
-        const onOnline = () => {
-            // перепідписка при поверненні в онлайн
-            connect();
-        };
-        const onOffline = () => {
-            wsClientRef.current?.close();
-        };
+        const onOnline = () => connect();
+        const onOffline = () => wsClientRef.current?.close();
         window.addEventListener("online", onOnline);
         window.addEventListener("offline", onOffline);
         return () => {
@@ -650,6 +642,15 @@ export default function Bot() {
                     </select>
                 </label>
             </div>
+
+            {/* live-настройки */}
+            <div className="mt-3">
+                <SettingsPanel
+                    value={settings}
+                    onChange={(s) => setSettings(s)}
+                />
+            </div>
+
 
             {/* графік */}
             <div className="mt-4">
