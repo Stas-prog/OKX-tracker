@@ -8,6 +8,7 @@ import { getDb } from "@/lib/mongo";
 export async function GET() {
     try {
         const db = await getDb();
+
         const cols = await db.listCollections().toArray();
         return NextResponse.json({
             ok: true,

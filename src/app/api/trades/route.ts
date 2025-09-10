@@ -5,6 +5,8 @@ export const revalidate = 0;
 import { NextResponse } from "next/server";
 import { getDb } from "@/lib/mongo";
 
+
+
 /** Документ угоди у Mongo */
 type TradeDoc = {
     _id: string;                 // side|ts|price|qtyKey
@@ -137,6 +139,11 @@ export async function POST(req: Request) {
     const body = await req.json() as Partial<TradeDoc> & { side: "BUY" | "SELL"; price: number; qty: number; ts: number; };
 
     const db = await getDb();
+
+    db.collection("trades").createIndex({ createdAt: -1 });
+    db.collection("trades").createIndex({ instId: 1, createdAt: -1 });
+    db.collection("trades").createIndex({ _id: 1 }, { unique: true });
+
     const col = db.collection<TradeDoc>("trades");
 
     const qtyKey = Number(body.qty).toFixed(6);
