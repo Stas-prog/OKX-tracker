@@ -21,6 +21,7 @@ function authOk(req: Request) {
   const token = bearer.startsWith("Bearer ") ? bearer.slice(7) : null;
   const qs = new URL(req.url).searchParams.get("secret");
   const want = process.env.CRON_SECRET;
+  
   return Boolean(want) && (token === want || qs === want);
 }
 
@@ -65,6 +66,8 @@ export async function GET(req: Request) {
   let result: any = null;
   try {
     const r = await fetch(`${process.env.NEXT_PUBLIC_BASE_URL ?? ""}/api/virtual-trader`, { cache: "no-store" });
+     if (req.headers.get('Authorization') !== `Bearer ${process.env.CRON_SECRET}`) {
+      return NextResponse.json({ status: 401, end: 'Unauthorized'});}
     result = await r.json();
   } catch (e: any) {
     result = { error: e?.message || String(e) };
