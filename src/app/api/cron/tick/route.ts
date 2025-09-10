@@ -6,14 +6,14 @@ import { NextResponse } from "next/server";
 import { getDb } from "@/lib/mongo";
 
 const LOCK_ID = "cron-lock";
-const MIN_INTERVAL_MS = 60_000; // мінімальна пауза між тиками
+const MIN_INTERVAL_MS = 60_000; 
 
 type LockDoc = {
-  _id: string;                 // "cron-lock"
-  heldBy?: string;             // ідентифікатор воркера (Vercel instance id)
-  until?: string;              // ISO, коли блок закінчується
-  lastRunAt?: string;          // ISO
-  updatedAt?: string;          // ISO
+  _id: string;                 
+  heldBy?: string;             
+  until?: string;              
+  lastRunAt?: string;          
+  updatedAt?: string;          
 };
 
 function authOk(req: Request) {
