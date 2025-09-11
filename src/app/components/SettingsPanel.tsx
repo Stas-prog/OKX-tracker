@@ -63,7 +63,7 @@ export default function SettingsPanel({ value, onChange }: { value: Settings; on
         </button>
       </div>
 
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-2 gap-3 text-black">
         <L label="EMA fast">
           <I type="number" value={String(local.emaFast)}
              onChange={e => setLocal({ ...local, emaFast: num(e.target.value, DEF.emaFast) })}/>

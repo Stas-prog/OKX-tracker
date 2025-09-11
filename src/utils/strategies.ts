@@ -12,12 +12,12 @@ export const strategies: Strategy[] = [
     },
     {
         instId: 'ETH-USDT',
-        buyBelow: 2900,
-        sellAbove: 3100,
+        buyBelow: 4400,
+        sellAbove: 4500,
     },
     {
-        instId: 'SOL-USDT',
-        buyBelow: 130,
-        sellAbove: 150,
+        instId: 'XRP-USDT',
+        buyBelow: 2.5,
+        sellAbove: 3.5,
     },
 ];
