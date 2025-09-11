@@ -7,8 +7,8 @@ export type Strategy = {
 export const strategies: Strategy[] = [
     {
         instId: 'BTC-USDT',
-        buyBelow: 57000,
-        sellAbove: 59000,
+        buyBelow: 114200,
+        sellAbove: 114600,
     },
     {
         instId: 'ETH-USDT',
