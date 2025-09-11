@@ -23,6 +23,5 @@ jobs:
       - name: Call /api/cron/tick
         run: |
           set -e
-          echo "GET $CRON_URL?token=***"
           curl -fsS "$CRON_URL?token=$CRON_SECRET"
           echo "OK"
