@@ -22,3 +22,4 @@ jobs:
           fi
           echo "GET $CRON_URL?token=***"
           curl -fsS "$CRON_URL?token=$CRON_SECRET" || exit 1
+          
