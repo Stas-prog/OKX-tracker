@@ -1,0 +1,24 @@
+name: OKX Tick Cron
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # кожні 10 хв (UTC)
+  workflow_dispatch:          # можливість запустити вручну з вкладки Actions
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /api/cron/tick
+        env:
+          CRON_URL: ${{ secrets.CRON_URL }}         # наприклад: https://okx-tracker.vercel.app/api/cron/tick
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}   # той самий, що на Vercel
+        run: |
+          if [ -z "$CRON_URL" ] || [ -z "$CRON_SECRET" ]; then
+            echo "CRON_URL/CRON_SECRET not set"; exit 1;
+          fi
+          echo "GET $CRON_URL?token=***"
+          curl -fsS "$CRON_URL?token=$CRON_SECRET" || exit 1
