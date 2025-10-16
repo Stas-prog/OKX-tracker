@@ -22,6 +22,7 @@ export default function VirtualTraderStatus() {
         try {
             const res = await axios.get('/api/trade')
             setStatus(res.data)
+console.log(res.data)
             setLoading(false)
         } catch (error) {
             console.error('Помилка при завантаженні статусу трейдера', error)
@@ -30,7 +31,7 @@ export default function VirtualTraderStatus() {
 
     useEffect(() => {
         fetchStatus()
-        const interval = setInterval(fetchStatus, 10000)
+        const interval = setInterval(fetchStatus, 7000)
         return () => clearInterval(interval)
     }, [])
 

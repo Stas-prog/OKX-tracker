@@ -1,113 +1,89 @@
-'use client';
-
-import { useEffect, useMemo, useState } from 'react';
+"use client";
+import { useEffect, useState } from "react";
 
 type Row = {
-    time: string;
-    action: string;
-    price: number;
-    instId?: string;
-    createdAt?: string;
+  _id: string;
+  source: "trades" | "vt_trades" | "multi_trades";
+  instId: string;
+  side: "buy" | "sell";
+  price: number;
+  quantity: number;
+  amountUsd?: number;
+  reason?: string;
+  ts?: string;
+  createdAt?: string;
 };
 
 export default function TradeHistoryTable() {
-    const [history, setHistory] = useState<Row[]>([]);
-    const [loading, setLoading] = useState(true);
-    const [order, setOrder] = useState<"desc" | "asc">("desc");
-    const [limit, setLimit] = useState(50);
+  const [rows, setRows] = useState<Row[]>([]);
+  const [loading, setLoading] = useState(true);
 
-    const lastTimestamp = useMemo(() => {
-        if (history.length === 0) return null;
-        // для order=desc беремо перший (найновіший), для asc — останній
-        return (order === "desc" ? history[0] : history[history.length - 1])?.createdAt || null;
-    }, [history, order]);
-
-    async function fetchHistory(initial = false) {
-        setLoading(initial);
-        const params = new URLSearchParams({ order, limit: String(limit) });
-        // можна додати since/before при скролі/пагінації
-        const res = await fetch(`/api/trade-history?${params.toString()}`, { cache: "no-store" });
-        const rows: Row[] = await res.json();
-        setHistory(rows);
+  useEffect(() => {
+    async function load() {
+      try {
+        const res = await fetch("/api/trade-history?limit=50");
+        const json = await res.json();
+        if (json.ok) setRows(json.rows);
+      } catch (e) {
+        console.error("TradeHistory fetch error", e);
+      } finally {
         setLoading(false);
+      }
     }
+    load();
+  }, []);
 
-    useEffect(() => {
-        fetchHistory(true);
-        const id = setInterval(() => fetchHistory(false), 15000);
-        return () => clearInterval(id);
-        // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [order, limit]);
+  if (loading) return <div className="p-4">Loading...</div>;
+  if (!rows.length) return <div className="p-4">No trades yet</div>;
 
-    return (
-        <div className="mt-10 bg-gray-900 p-6 rounded shadow w-full max-w-2xl mx-auto">
-            <div className="flex items-center gap-3 mb-4">
-                <h2 className="text-xl font-bold flex-1">📘 Історія подій / трейдів</h2>
-                <label className="text-sm text-gray-300">
-                    Порядок:&nbsp;
-                    <select
-                        className="bg-gray-800 border border-gray-700 rounded px-2 py-1"
-                        value={order}
-                        onChange={(e) => setOrder(e.target.value as "desc" | "asc")}
-                    >
-                        <option value="desc">Нові згори</option>
-                        <option value="asc">Старі згори</option>
-                    </select>
-                </label>
-                <label className="text-sm text-gray-300">
-                    Ліміт:&nbsp;
-                    <select
-                        className="bg-gray-800 border border-gray-700 rounded px-2 py-1"
-                        value={limit}
-                        onChange={(e) => setLimit(parseInt(e.target.value, 10))}
-                    >
-                        <option value={20}>20</option>
-                        <option value={50}>50</option>
-                        <option value={100}>100</option>
-                        <option value={500}>500</option>
-                    </select>
-                </label>
-            </div>
+  const badgeColor = (src: string) =>
+    src === "multi_trades" ? "bg-purple-200 text-purple-800"
+    : src === "vt_trades" ? "bg-blue-200 text-blue-800"
+    : "bg-green-200 text-green-800";
 
-            {loading ? (
-                <div className="text-gray-400">⏳ Завантаження…</div>
-            ) : history.length === 0 ? (
-                <div className="text-gray-400">Поки що немає записів…</div>
-            ) : (
-                <table className="w-full text-sm border border-gray-700">
-                    <thead>
-                        <tr className="border-b border-gray-700 text-gray-400">
-                            <th className="py-1 px-2 text-left">Час</th>
-                            <th className="py-1 px-2 text-left">Інструмент</th>
-                            <th className="py-1 px-2 text-left">Дія</th>
-                            <th className="py-1 px-2 text-right">Ціна</th>
-                        </tr>
-                    </thead>
-                    <tbody>
-                        {history.map((t, i) => (
-                            <tr key={i} className="border-b border-gray-800">
-                                <td className="py-1 px-2 text-gray-300">
-                                    {formatTs(t.createdAt || t.time)}
-                                </td>
-                                <td className="py-1 px-2">{t.instId ?? "—"}</td>
-                                <td className="py-1 px-2">{t.action}</td>
-                                <td className="py-1 px-2 text-right">{number(t.price)}</td>
-                            </tr>
-                        ))}
-                    </tbody>
-                </table>
-            )}
+  const sideColor = (side: string) =>
+    side === "buy" ? "text-green-600 font-bold" : "text-red-600 font-bold";
 
-            <div className="text-xs text-gray-500 mt-2">
-                Остання мітка: {lastTimestamp ? formatTs(lastTimestamp) : "—"}
-            </div>
-        </div>
-    );
-}
-
-function formatTs(iso: string) {
-    try { return new Date(iso).toLocaleString(); } catch { return iso; }
-}
-function number(x: number) {
-    return new Intl.NumberFormat("en-US", { maximumFractionDigits: 8 }).format(x);
+  return (
+    <div className="overflow-x-auto p-4">
+      <table className="min-w-full border border-gray-200 text-sm">
+        <thead className="bg-gray-100">
+          <tr>
+            <th className="px-2 py-1 border text-green-900">Time</th>
+            <th className="px-2 py-1 border text-green-900">Source</th>
+            <th className="px-2 py-1 border text-green-900">Inst</th>
+            <th className="px-2 py-1 border text-green-900">Side</th>
+            <th className="px-2 py-1 border text-green-900">Price</th>
+            <th className="px-2 py-1 border text-green-900">Qty</th>
+            <th className="px-2 py-1 border text-green-900">USD</th>
+            <th className="px-2 py-1 border text-green-900">Reason</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r._id}>
+              <td className="px-2 py-1 border text-xs">
+                {r.ts
+                  ? new Date(r.ts).toLocaleString()
+                  : r.createdAt
+                  ? new Date(r.createdAt).toLocaleString()
+                  : "-"}
+              </td>
+              <td className="px-2 py-1 border">
+                <span className={`px-2 py-0.5 rounded text-xs ${badgeColor(r.source)}`}>
+                  {r.source.replace("_trades", "")}
+                </span>
+              </td>
+              <td className="px-2 py-1 border">{r.instId}</td>
+              <td className={`px-2 py-1 border ${sideColor(r.side)}`}>{r.side}</td>
+              <td className="px-2 py-1 border">{r.price?.toFixed(2)}</td>
+              <td className="px-2 py-1 border">{r.quantity?.toFixed(4)}</td>
+              <td className="px-2 py-1 border">{r.amountUsd?.toFixed(2)}</td>
+              <td className="px-2 py-1 border text-xs">{r.reason ?? "-"}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
 }

@@ -1,24 +1,32 @@
-export const dynamic = "force-dynamic";
-export const runtime = "nodejs";
-export const revalidate = 0;
-
 import { NextResponse } from "next/server";
-import { getTradeHistory } from "@/lib/trade-log";
+import { getDb } from "@/lib/mongo";
+import { addTrade, getTradeHistory, TradeDoc } from "@/lib/trade-log";
 
-// GET /api/trade-history?limit=100&since=ISO&before=ISO&order=asc|desc
+// GET ?limit=100
 export async function GET(req: Request) {
+  try {
     const url = new URL(req.url);
-    const limit = url.searchParams.get("limit") ?? undefined;
-    const since = url.searchParams.get("since") ?? undefined;
-    const before = url.searchParams.get("before") ?? undefined;
-    const order = (url.searchParams.get("order") as "asc" | "desc") ?? "desc";
+    const limit = Number(url.searchParams.get("limit") || 100);
+    const db = await getDb();
+    const rows = await getTradeHistory(db, Math.min(Math.max(limit, 1), 500));
+    return NextResponse.json({ ok: true, rows });
+  } catch (e) {
+    console.error("trade-history GET error", e);
+    return NextResponse.json({ ok: false, message: String(e) }, { status: 500 });
+  }
+}
 
-    const items = await getTradeHistory({
-        limit: limit ? Math.max(1, Math.min(2000, parseInt(limit, 10))) : undefined,
-        since: since || undefined,
-        before: before || undefined,
-        order,
-    });
-
-    return NextResponse.json(items);
+export async function POST(req: Request) {
+  try {
+    const db = await getDb();
+    const body = (await req.json()) as Partial<TradeDoc>;
+    if (!body?.instId || !body?.side || !body?.price || !body?.quantity) {
+      return NextResponse.json({ ok: false, message: "instId, side, price, quantity required" }, { status: 400 });
+    }
+    const inserted = await addTrade(db, body as TradeDoc, "trades");
+    return NextResponse.json({ ok: true, inserted });
+  } catch (e) {
+    console.error("trade-history POST error", e);
+    return NextResponse.json({ ok: false, message: String(e) }, { status: 500 });
+  }
 }

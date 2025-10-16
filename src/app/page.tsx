@@ -7,6 +7,7 @@ import VirtualTraderTable from './components/VirtualTraderTable';
 import TradeHistoryTable from './components/TradeHistoryTable';
 import BTCChart from './components/BTCChart'
 import Bot from './components/Bot'
+import Link from 'next/link';
 
 
 
@@ -39,7 +40,7 @@ export default function HomePage() {
 
   useEffect(() => {
     fetchPrices()
-    const interval = setInterval(fetchPrices, 10000)
+    const interval = setInterval(fetchPrices, 4000)
     return () => clearInterval(interval)
   }, [])
 
@@ -56,10 +57,14 @@ export default function HomePage() {
           </li>
         ))}
       </ul>
+      
       <VirtualTraderStatus />
       <VirtualTraderTable />
       <TradeHistoryTable />
       <BTCChart />
+      <Link href="/multi-trader" className="mt-6 px-4 py-2 bg-blue-600 rounded hover:bg-blue-700 inline-block">
+        Перейти до MultiTrader
+      </Link>
       <Bot />
     </main>
   )

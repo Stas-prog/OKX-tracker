@@ -1,18 +1,20 @@
 import { getDb } from "@/lib/mongo";
+import { ObjectId } from "mongodb";
 
 /** Формат однієї стратегії в БД */
 export type VTStrategy = {
-  _id: string;                
-  instId: string;              
-  mode?: "absolute" | "relative"; 
-  // absolute:
-  buyBelow?: number;           
-  sellAbove?: number;          
-  // relative:
-  buyPctBelow?: number;     
-  sellPctFromEntry?: number;   
-  // спільне:
-  maxHoldMinutes?: number;     
+  _id: any;                  
+  instId: string;
+  mode?: "absolute" | "relative";
+  buyBelow?: number;
+  sellAbove?: number;
+  buyPctBelow?: number;       
+  sellPctFromEntry?: number;    
+  budgetUsd?: number;
+  budgetBtc?: number;          
+  staircaseBuyUsd?: number[];  
+  staircaseSellFractions?: number[];
+  maxHoldMinutes?: number; 
   updatedAt?: string;
 };
 
@@ -33,13 +35,22 @@ export async function upsertStrategy(s: VTStrategy) {
   await ensureStrategyIndexes();
   const now = new Date().toISOString();
   const doc: VTStrategy = {
-    _id: s.instId,
+    _id: ObjectId,
     instId: s.instId,
     mode: s.mode ?? "relative",
+
     buyBelow: s.buyBelow,
     sellAbove: s.sellAbove,
-    buyPctBelow: s.buyPctBelow,
-    sellPctFromEntry: s.sellPctFromEntry,
+
+    buyPctBelow: s.buyPctBelow ?? -0.0001,           
+    sellPctFromEntry: s.sellPctFromEntry ?? 0.0001,  
+
+    budgetUsd: s.budgetUsd ?? 1000,
+    budgetBtc: s.budgetUsd ?? 0.01,
+
+    staircaseBuyUsd: s.staircaseBuyUsd ?? [1],
+    staircaseSellFractions: s.staircaseSellFractions ?? [1],
+
     maxHoldMinutes: s.maxHoldMinutes ?? 10,
     updatedAt: now,
   };
@@ -54,5 +65,5 @@ export async function upsertStrategy(s: VTStrategy) {
 
 export async function deleteStrategy(instId: string) {
   const db = await getDb();
-  await db.collection<VTStrategy>("vt_strategies").deleteOne({ _id: instId });
+  await db.collection<VTStrategy>("vt_strategies").deleteOne({ instId: instId });
 }

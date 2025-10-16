@@ -1,58 +1,66 @@
-import { getDb } from "@/lib/mongo";
+import type { Db, Document } from "mongodb";
 
-export type TradeAction = {
-    time: string;        // ISO або локальний час — покажемо як є
-    action: string;      // "BUY" | "SELL" | текст для віртуального бота
-    price: number;
-    instId?: string;     // напр. "BTC-USDT"
-    createdAt?: string;  // ISO для сорту/фільтрів
+export type TradeDoc = {
+  _id?: any;
+  source: "trades" | "vt_trades" | "multi_trades";
+  instId: string;
+  side: "buy" | "sell";
+  price: number;
+  quantity: number;
+  amountUsd?: number;
+  reason?: string;
+  id?: string;        // біржовий/симуляційний id
+  ts?: string;        // час ордеру
+  createdAt?: string; // час запису
 };
 
-const COL = "mini_trades";
-
-/** Додає запис у Mongo (read-only для клієнта). */
-export async function addTrade(action: TradeAction) {
-    const db = await getDb();
-    const doc: TradeAction = {
-        ...action,
-        createdAt: action.createdAt || new Date().toISOString(),
-    };
-    await db.collection<TradeAction>(COL).insertOne(doc as any);
+// Запис у конкретну колекцію (за замовчуванням 'trades')
+export async function addTrade(db: Db, doc: TradeDoc, collection = "trades") {
+  const coll = db.collection(collection);
+  const toInsert: TradeDoc = {
+    ...doc,
+    source: (collection as TradeDoc["source"]) ?? "trades",
+    createdAt: doc.createdAt ?? new Date().toISOString(),
+    ts: doc.ts ?? new Date().toISOString(),
+  };
+  await coll.insertOne(toInsert as Document);
+  return toInsert;
 }
 
-/** Повертає історію з параметрами (за замовчуванням останні 50, нові згори). */
-export async function getTradeHistory(params?: {
-    limit?: number;
-    since?: string;   // createdAt > since
-    before?: string;  // createdAt < before
-    order?: "asc" | "desc";
-}) {
-    const limit = Math.min(params?.limit ?? 50, 2000);
-    const order = (params?.order ?? "desc") === "asc" ? 1 : -1;
+// Об’єднане читання з trades + vt_trades + multi_trades
+export async function getTradeHistory(db: Db, limit = 100) {
+  const baseProject = {
+    _id: 1, instId: 1, side: 1, price: 1, quantity: 1, amountUsd: 1, reason: 1, id: 1, ts: 1, createdAt: 1,
+  };
 
-    const filter: any = {};
-    if (params?.since || params?.before) {
-        filter.createdAt = {};
-        if (params.since) filter.createdAt.$gt = params.since;
-        if (params.before) filter.createdAt.$lt = params.before;
-    }
+  const pipe: Document[] = [
+    { $project: { ...baseProject, source: { $literal: "trades" } } },
+    { $unionWith: {
+        coll: "vt_trades",
+        pipeline: [{ $project: { ...baseProject, source: { $literal: "vt_trades" } } }]
+      }
+    },
+    { $unionWith: {
+        coll: "multi_trades",
+        pipeline: [{ $project: { ...baseProject, source: { $literal: "multi_trades" } } }]
+      }
+    },
+    { $addFields: {
+        sortTs: {
+          $ifNull: [
+            { $toDate: "$ts" },
+            { $ifNull: [ { $toDate: "$createdAt" }, new Date(0) ] }
+          ]
+        }
+      }
+    },
+    { $sort: { sortTs: -1, _id: -1 } },
+    { $limit: limit },
+  ];
 
-    const db = await getDb();
-    const rows = await db
-        .collection<TradeAction>(COL)
-        .find(filter)
-        .sort({ createdAt: order })
-        .limit(limit)
-        .toArray();
-
-    // повертаємо у старому форматі для сумісності з UI
-    return rows.map(({ time, action, price, instId, createdAt }) => ({
-        time, action, price, instId, createdAt,
-    }));
+  const cursor = db.collection("trades").aggregate(pipe);
+  const rows = await cursor.toArray();
+  return rows;
 }
 
-/** (Опційно) кількість документів — зручно для пагінації. */
-export async function countTradeHistory() {
-    const db = await getDb();
-    return db.collection(COL).countDocuments();
-}
+

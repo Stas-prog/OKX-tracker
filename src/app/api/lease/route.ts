@@ -24,6 +24,7 @@ export async function GET() {
 
 export async function POST(req: Request) {
   const { holderId } = await req.json() as { holderId: string };
+  console.log(holderId)
   if (!holderId) return NextResponse.json({ ok: false, error: "holderId required" }, { status: 400 });
 
   const db = await getDb();
