@@ -68,7 +68,7 @@ export async function GET() {
   }
 }
 
-export async function Delete() {
+export async function DELETE() {
   try {
      
      const last = getLastTxn();
