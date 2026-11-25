@@ -1,3 +1,5 @@
+import "server-only";
+
 import { MongoClient } from "mongodb";
 
 let clientPromise: Promise<MongoClient> | null = null;

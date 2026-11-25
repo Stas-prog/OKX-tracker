@@ -2,7 +2,12 @@
 import type { Db } from "mongodb";
 
 type InstId = string;
-type StairStep = { pctDrop: number; amountPct: number };
+
+type StairStep = {
+  pctDrop: number;
+  amountPct: number;
+};
+
 export type MultiStrategy = {
   id?: string;
   name: string;
@@ -15,7 +20,11 @@ export type MultiStrategy = {
   rebalanceIntervalSec?: number;
 };
 
-type PricePoint = { instId: InstId; price: number; ts?: string; };
+type PricePoint = {
+  instId: InstId;
+  price: number;
+  ts?: string;
+};
 
 export type Order = {
   id?: string;
@@ -27,13 +36,18 @@ export type Order = {
   quantity: number;
   reason?: string;
   ts?: string;
+  strategyId?: string;
 };
 
 const nowIso = () => new Date().toISOString();
-const clamp = (v:number,a:number,b:number) => Math.max(a, Math.min(b, v));
+
+const clamp = (value: number, min: number, max: number) =>
+  Math.max(min, Math.min(max, value));
 
 async function defaultGetDb(): Promise<Db> {
-  throw new Error("MultiTrader: please provide getDb() implementation when constructing.");
+  throw new Error(
+    "MultiTrader: please provide getDb() implementation when constructing."
+  );
 }
 
 export class MultiTrader {
@@ -51,16 +65,18 @@ export class MultiTrader {
     this.strategy = {
       baseAllocationPct: 0.2,
       maxAllocationPct: 0.5,
-      staircase: [ 
-        { pctDrop: 0.005, amountPct: 0.05 }, // 0.5%
-        { pctDrop: 0.01,  amountPct: 0.05 } 
- ],
+      staircase: [
+        { pctDrop: 0.005, amountPct: 0.05 },
+        { pctDrop: 0.01, amountPct: 0.05 },
+      ],
       stopLossPct: 0.01,
       takeProfitPct: 0.01,
       rebalanceIntervalSec: 3600,
       ...opts.strategy,
     };
-    const instIds = (this.strategy.instIds || []).slice(0,5);
+
+    const instIds = (this.strategy.instIds || []).slice(0, 5);
+
     this.state = {
       capitalUsd: opts.capitalUsd,
       cashUsd: opts.capitalUsd,
@@ -70,257 +86,842 @@ export class MultiTrader {
         quantity: 0,
         avgEntryPrice: 0,
         staircaseUsed: {},
-        history: [] as number[], 
+        history: [],
       })),
       updatedAt: nowIso(),
       strategyId: this.strategy.id ?? this.strategy.name ?? "multi-default",
     };
+
     this.getDb = opts.getDb ?? defaultGetDb;
     this.executeOrderFn = opts.executeOrderFn;
   }
 
-  // Initialize equal allocation
+  // Початкова рівномірна симуляційна купівля.
   async initializePortfolio(prices: PricePoint[]) {
     const basePct = this.strategy.baseAllocationPct ?? 0.2;
+    const initialOrders: Order[] = [];
+
     for (const inst of this.state.instStates) {
-      const price = prices.find(p => p.instId === inst.instId)?.price;
-      if (!price) continue;
+      const price = prices.find((p) => p.instId === inst.instId)?.price;
+
+      if (!price || !Number.isFinite(price) || price <= 0) {
+        continue;
+      }
+
       const amountUsd = this.state.capitalUsd * basePct;
-      const qty = amountUsd / price;
-      const ord: Order = { instId: inst.instId, side: "buy", price, amountUsd, quantity: qty, reason: "initial_allocation", ts: nowIso() };
-      await this._execute(ord);
-      inst.allocatedUsd += amountUsd;
-      inst.quantity += qty;
-      inst.avgEntryPrice = inst.quantity ? (inst.allocatedUsd / inst.quantity) : price;
-      this.state.cashUsd = clamp(this.state.cashUsd - amountUsd, 0, this.state.capitalUsd);
-    }
-    // refresh prevPrice for the next tick
-for (const inst of this.state.instStates) {
-  const p = prices.find(x => x.instId === inst.instId)?.price;
-  if (p) (inst as any).prevPrice = p;
-}
 
-    this.state.updatedAt = nowIso();
-    await this.saveState();
-  }
+      if (amountUsd <= 0 || this.state.cashUsd < amountUsd) {
+        continue;
+      }
 
-  // Main tick: prices from market
-  async onTick(prices: PricePoint[]) {
-    const orders: Order[] = [];
+      const order: Order = {
+        instId: inst.instId,
+        side: "buy",
+        price,
+        amountUsd,
+        quantity: amountUsd / price,
+        reason: "initial_allocation",
+        ts: nowIso(),
+      };
 
-    // init prevPrice one-time per instrument (for momentum)
-   for (const inst of this.state.instStates) {
-  const p = prices.find(x => x.instId === inst.instId)?.price;
-  if (!p) continue;
-  // prevPrice init
-  if ((inst as any).prevPrice == null) (inst as any).prevPrice = p;
-  // history (rolling window 20)
-  inst.history = Array.isArray(inst.history) ? inst.history : [];
-  inst.history.push(p);
-  if (inst.history.length > 20) inst.history.shift();
-}
+      const executed = await this._executeAndApply(order);
 
-
-
-    // 1) take profit / stop loss checks
-    for (const inst of this.state.instStates) {
-      const p = prices.find(x => x.instId === inst.instId);
-      if (!p) continue;
-      const price = p.price;
-      if (inst.quantity > 0 && inst.avgEntryPrice > 0) {
-        const pnlPct = (price - inst.avgEntryPrice)/inst.avgEntryPrice;
-        if ((this.strategy.takeProfitPct ?? 0.08) > 0 && pnlPct >= (this.strategy.takeProfitPct ?? 0.08)) {
-          orders.push({ instId: inst.instId, side: "sell", price, amountUsd: inst.allocatedUsd * 0.5, quantity: (inst.allocatedUsd * 0.5) / price, reason: "take_profit_partial", ts: nowIso() });
-        }
-        if ((this.strategy.stopLossPct ?? 0.15) > 0 && pnlPct <= -(this.strategy.stopLossPct ?? 0.15)) {
-          orders.push({ instId: inst.instId, side: "sell", price, amountUsd: inst.allocatedUsd, quantity: inst.allocatedUsd/price, reason: "stop_loss_exit", ts: nowIso() });
-        }
+      if (executed) {
+        initialOrders.push(executed);
       }
     }
 
-    // 2) staircase buys
+    // Запам'ятовуємо ціну для наступного розрахунку momentum.
     for (const inst of this.state.instStates) {
-      const p = prices.find(x => x.instId === inst.instId);
-      if (!p) continue;
-      const price = p.price;
-      const ref = (inst.avgEntryPrice && inst.avgEntryPrice>0) ? inst.avgEntryPrice : price;
+      const price = prices.find((p) => p.instId === inst.instId)?.price;
+
+      if (price && Number.isFinite(price) && price > 0) {
+        inst.prevPrice = price;
+      }
+    }
+
+    this.state.updatedAt = nowIso();
+
+    await this.saveState();
+    await this._saveTrades(initialOrders);
+
+    return { orders: initialOrders };
+  }
+
+  // Основний симуляційний tick.
+  async onTick(prices: PricePoint[]) {
+  const orders: Order[] = [];
+  // ЛАБОРАТОРІЯ: для повної діагностики розкоментувати оголошення diagnostics
+  // const diagnostics: any[] = [];
+
+    // Оновлюємо історію цін.
+    for (const inst of this.state.instStates) {
+      const price = prices.find((p) => p.instId === inst.instId)?.price;
+
+      if (!price || !Number.isFinite(price) || price <= 0) {
+        continue;
+      }
+
+      if (inst.prevPrice == null) {
+        inst.prevPrice = price;
+      }
+
+      inst.history = Array.isArray(inst.history) ? inst.history : [];
+      inst.history.push(price);
+
+      if (inst.history.length > 20) {
+        inst.history.shift();
+      }
+    }
+
+    // 1. Take profit / Stop loss.
+    for (const inst of this.state.instStates) {
+      const price = prices.find((p) => p.instId === inst.instId)?.price;
+
+      if (!price || price <= 0 || inst.quantity <= 0) {
+        continue;
+      }
+
+      const avgEntry = inst.avgEntryPrice || 0;
+
+      if (avgEntry <= 0) {
+        continue;
+      }
+
+      const pnlPct = (price - avgEntry) / avgEntry;
+
+      const takeProfitPct = this.strategy.takeProfitPct ?? 0.08;
+      const stopLossPct = this.strategy.stopLossPct ?? 0.15;
+
+      if (takeProfitPct > 0 && pnlPct >= takeProfitPct) {
+        const quantity = inst.quantity * 0.5;
+
+        orders.push({
+          instId: inst.instId,
+          side: "sell",
+          price,
+          quantity,
+          amountUsd: quantity * price,
+          reason: "take_profit_partial",
+          ts: nowIso(),
+        });
+      } else if (stopLossPct > 0 && pnlPct <= -stopLossPct) {
+        orders.push({
+          instId: inst.instId,
+          side: "sell",
+          price,
+          quantity: inst.quantity,
+          amountUsd: inst.quantity * price,
+          reason: "stop_loss_exit",
+          ts: nowIso(),
+        });
+      }
+    }
+
+    // 2. Staircase buys.
+    for (const inst of this.state.instStates) {
+      const price = prices.find((p) => p.instId === inst.instId)?.price;
+
+      if (!price || price <= 0) {
+        continue;
+      }
+
+      const referencePrice =
+        inst.avgEntryPrice > 0 ? inst.avgEntryPrice : price;
+
       const steps = this.strategy.staircase || [];
-      for (let i=0;i<steps.length;i++){
-        if (inst.staircaseUsed && inst.staircaseUsed[i]) continue;
+
+      for (let i = 0; i < steps.length; i++) {
+        if (inst.staircaseUsed?.[i]) {
+          continue;
+        }
+
         const step = steps[i];
-        const drop = (ref - price)/ref;
+        const drop = (referencePrice - price) / referencePrice;
+
         if (drop >= step.pctDrop) {
-          const baseAlloc = (this.strategy.baseAllocationPct ?? 0.2) * this.state.capitalUsd;
-          const buyUsd = baseAlloc * step.amountPct;
-          if (this.state.cashUsd >= buyUsd && buyUsd>0) {
-            orders.push({ instId: inst.instId, side: "buy", price, amountUsd: buyUsd, quantity: buyUsd/price, reason: `staircase_buy_step_${i}`, ts: nowIso() });
+          const baseAllocation =
+            (this.strategy.baseAllocationPct ?? 0.2) *
+            this.state.capitalUsd;
+
+          const buyUsd = baseAllocation * step.amountPct;
+
+          if (buyUsd > 0 && this.state.cashUsd >= buyUsd) {
+            orders.push({
+              instId: inst.instId,
+              side: "buy",
+              price,
+              amountUsd: buyUsd,
+              quantity: buyUsd / price,
+              reason: `staircase_buy_step_${i}`,
+              ts: nowIso(),
+            });
           }
         }
       }
     }
 
-    // 2.5) SMA сигнали (дають природні дрібні трейди)
-for (const inst of this.state.instStates) {
-  const p = prices.find(x => x.instId === inst.instId)?.price;
-  if (!p) continue;
-  const h = (inst.history || []) as number[];
-  if (h.length >= 5) {
-    const sma = h.slice(-5).reduce((a,b)=>a+b,0) / 5;
-    const dev = (p - sma) / sma; // відхилення від середнього
+    // 3. SMA signals.
+    for (const inst of this.state.instStates) {
+      const price = prices.find((p) => p.instId === inst.instId)?.price;
 
-    // якщо ціна нижча за SMA на 0.3% — докупимо на 2% від капіталу (за наявності кешу)
-    if (dev <= -0.003) {
-      const buyUsd = this.state.capitalUsd * 0.02;
-      if (this.state.cashUsd >= buyUsd && buyUsd > 0) {
-        orders.push({
-          instId: inst.instId,
-          side: "buy",
-          price: p,
-          amountUsd: buyUsd,
-          quantity: buyUsd / p,
-          reason: "sma_mean_revert_buy",
-          ts: nowIso(),
-        });
+      if (!price || price <= 0) {
+        continue;
       }
-    }
 
-    // якщо ціна вища за SMA на 0.3% і є позиція — частково зафіксувати 2%
-    if (dev >= 0.003 && inst.allocatedUsd > 0) {
-      const sellUsd = Math.min(inst.allocatedUsd * 0.1, this.state.capitalUsd * 0.02);
-      if (sellUsd > 0) {
-        orders.push({
-          instId: inst.instId,
-          side: "sell",
-          price: p,
-          amountUsd: sellUsd,
-          quantity: sellUsd / p,
-          reason: "sma_mean_revert_sell",
-          ts: nowIso(),
-        });
-      }
-    }
-  }
+      const history = (inst.history || []) as number[];
+
+// Поточна ціна вже додана в history.
+// Беремо п'ять попередніх значень, без поточного.
+if (history.length < 6) {
+  continue;
 }
 
+const previousFive = history.slice(-6, -1);
+const sma =
+  previousFive.reduce((sum, value) => sum + value, 0) / 5;
+      if (sma <= 0) {
+        continue;
+      }
 
-    // 3) naive momentum stub: (real implementation should use EMA/RSI)
-    const momentumScores = await this.evaluateMomentum(prices);
-    const sorted = Object.entries(momentumScores).sort((a,b)=>b[1]-a[1]);
-    if (sorted.length>0 && sorted[0][1] > 0.003) {
-      const top = sorted[0][0];
-      // reallocate small amount from weakest
-      const topState = this.state.instStates.find((s:{instId:string})=>s.instId===top);
-      const currentPct = topState ? topState.allocatedUsd / this.state.capitalUsd : 0;
-      const maxPct = this.strategy.maxAllocationPct ?? 0.5;
-      const targetAddPct = Math.min(0.03, maxPct - currentPct);
-      if (targetAddPct > 0) {
-        let needUsd = this.state.capitalUsd * targetAddPct;
-    const weakest = [...this.state.instStates].sort(
-      (a: any, b: any) => (momentumScores[a.instId] || 0) - (momentumScores[b.instId] || 0));
-        for (const w of weakest) {
-          if (w.instId === top) continue;
-          const avail = Math.min(w.allocatedUsd * 0.5, needUsd);
-          if (avail <= 0) continue;
-          orders.push({ instId: w.instId, side: "sell", price: prices.find(p=>p.instId===w.instId)?.price||0, amountUsd: avail, quantity: (prices.find(p=>p.instId===w.instId)?.price||1) ? avail / (prices.find(p=>p.instId===w.instId)!.price) : 0, reason:`reallocate_to_${top}`, ts: nowIso() });
-          orders.push({ instId: top, side: "buy", price: prices.find(p=>p.instId===top)?.price||0, amountUsd: avail, quantity: (prices.find(p=>p.instId===top)?.price||1) ? avail / (prices.find(p=>p.instId===top)!.price) : 0, reason:`reallocate_from_${w.instId}`, ts: nowIso() });
-          needUsd -= avail;
-          if (needUsd <= 0) break;
+      const deviation = (price - sma) / sma;
+
+      // Ціна нижча за SMA на 0.3% — невелика докупівля.
+      if (deviation <= -0.003) {
+        const buyUsd = this.state.capitalUsd * 0.02;
+
+        if (buyUsd > 0 && this.state.cashUsd >= buyUsd) {
+          orders.push({
+            instId: inst.instId,
+            side: "buy",
+            price,
+            amountUsd: buyUsd,
+            quantity: buyUsd / price,
+            reason: "sma_mean_revert_buy",
+            ts: nowIso(),
+          });
+        }
+      }
+
+      // Ціна вища за SMA на 0.3% — частковий продаж.
+      if (deviation >= 0.003 && inst.quantity > 0) {
+        const sellUsd = Math.min(
+          inst.quantity * price * 0.1,
+          this.state.capitalUsd * 0.02
+        );
+
+        const quantity = sellUsd / price;
+
+        if (quantity > 0) {
+          orders.push({
+            instId: inst.instId,
+            side: "sell",
+            price,
+            amountUsd: sellUsd,
+            quantity,
+            reason: "sma_mean_revert_sell",
+            ts: nowIso(),
+          });
         }
       }
     }
 
-    // Execute orders sequentially
-    const executed: Order[] = [];
-    for (const o of orders) {
-      const r = await this._execute(o);
-      executed.push(r);
-      await this._applyOrderToState(r);
-    }
+    // 4. Momentum та перерозподіл.
+    const momentumScores = await this.evaluateMomentum(prices);
 
-    // refresh prevPrice for the next tick
-for (const inst of this.state.instStates) {
-  const p = prices.find(x => x.instId === inst.instId)?.price;
-  if (p) (inst as any).prevPrice = p;
-}
+    const sorted = Object.entries(momentumScores).sort(
+      (a, b) => b[1] - a[1]
+    );
 
+    if (sorted.length > 1 && sorted[0][1] > 0.003) {
+      const strongestId = sorted[0][0];
 
-    this.state.updatedAt = nowIso();
-    await this.saveState();
-    await this._saveTrades(executed);
-    return { orders: executed };
-  }
+      const strongest = this.state.instStates.find(
+        (item: any) => item.instId === strongestId
+      );
 
-  // placeholder: compute momentum; replace with real indicators
- async evaluateMomentum(prices: PricePoint[]): Promise<Record<InstId, number>> {
-  const out: Record<InstId, number> = {};
-  for (const s of this.state.instStates) {
-    const p = prices.find(pp => pp.instId === s.instId)?.price;
-    const prev = (s as any).prevPrice;
-    out[s.instId] = (p && prev) ? (p - prev) / prev : 0; // відносна зміна з останнього тіку
-  }
-  return out;
-}
+      const currentPct = strongest
+        ? strongest.allocatedUsd / this.state.capitalUsd
+        : 0;
 
+      const maxPct = this.strategy.maxAllocationPct ?? 0.5;
+      const targetAddPct = Math.min(0.03, maxPct - currentPct);
 
+      if (targetAddPct > 0) {
+        let needUsd = this.state.capitalUsd * targetAddPct;
 
-  private async _execute(order: Order): Promise<Order> {
-    const ord = { ...order, ts: order.ts ?? nowIso() };
-    if (this.executeOrderFn) {
-      try {
-        const res = await this.executeOrderFn(ord);
-        return { ...ord, ...res, ts: nowIso() };
-      } catch (e) {
-        console.error("executeOrderFn failed", e);
+        const weakestFirst = [...this.state.instStates].sort(
+          (a: any, b: any) =>
+            (momentumScores[a.instId] || 0) -
+            (momentumScores[b.instId] || 0)
+        );
+
+        for (const weak of weakestFirst) {
+          if (weak.instId === strongestId) {
+            continue;
+          }
+
+          const weakPrice = prices.find(
+            (p) => p.instId === weak.instId
+          )?.price;
+
+          const strongPrice = prices.find(
+            (p) => p.instId === strongestId
+          )?.price;
+
+          if (
+            !weakPrice ||
+            !strongPrice ||
+            weakPrice <= 0 ||
+            strongPrice <= 0 ||
+            weak.quantity <= 0
+          ) {
+            continue;
+          }
+
+          const sellQuantity = Math.min(
+            weak.quantity * 0.5,
+            needUsd / weakPrice
+          );
+
+          const sellUsd = sellQuantity * weakPrice;
+
+          if (sellUsd <= 0) {
+            continue;
+          }
+
+          orders.push({
+            instId: weak.instId,
+            side: "sell",
+            price: weakPrice,
+            amountUsd: sellUsd,
+            quantity: sellQuantity,
+            reason: `reallocate_from_${weak.instId}`,
+            ts: nowIso(),
+          });
+
+          orders.push({
+            instId: strongestId,
+            side: "buy",
+            price: strongPrice,
+            amountUsd: sellUsd,
+            quantity: sellUsd / strongPrice,
+            reason: `reallocate_to_${strongestId}`,
+            ts: nowIso(),
+          });
+
+          needUsd -= sellUsd;
+
+          if (needUsd <= 0) {
+            break;
+          }
+        }
       }
     }
-    return { ...ord, id: `sim-${Date.now()}`, ts: nowIso() };
+
+    /* ЛАБОРАТОРІЯ: повна діагностика кожної позиції.
+       Для повернення діагностики в API розкоментувати цей блок
+       разом із diagnostics вище та полем diagnostics у return нижче.
+for (const inst of this.state.instStates) {
+  const price = prices.find(
+    (p) => p.instId === inst.instId
+  )?.price;
+
+  if (!price || price <= 0) {
+    diagnostics.push({
+      instId: inst.instId,
+      error: "Ціна недоступна",
+    });
+    continue;
   }
 
-  private async _applyOrderToState(ord: Order) {
-    const inst = this.state.instStates.find((s:any)=>s.instId === ord.instId);
-    if (!inst) return;
-    if (ord.side === "buy") {
-      inst.allocatedUsd = (inst.allocatedUsd||0) + ord.amountUsd;
-      const added = ord.quantity;
-      const prevQty = inst.quantity || 0;
-      const prevAlloc = prevQty * (inst.avgEntryPrice || 0);
-      const totalQty = prevQty + added;
-      inst.avgEntryPrice = totalQty>0 ? (prevAlloc + ord.amountUsd)/totalQty : ord.price;
-      inst.quantity = totalQty;
-      inst.lastBuyTimestamp = nowIso();
-      const m = ord.reason?.match(/staircase_buy_step_(\d+)/);
-      if (m) inst.staircaseUsed = { ...(inst.staircaseUsed||{}), [parseInt(m[1],10)]: true };
-      this.state.cashUsd = clamp(this.state.cashUsd - ord.amountUsd, 0, this.state.capitalUsd);
+  const history = (inst.history || []) as number[];
+
+const smaReady = history.length >= 6;
+
+const previousFive = smaReady
+  ? history.slice(-6, -1)
+  : [];
+
+const sma = smaReady
+  ? previousFive.reduce((a, b) => a + b, 0) / 5
+  : null;
+
+  const smaDeviation =
+    sma && sma > 0 ? (price - sma) / sma : null;
+
+  const previousPrice = inst.prevPrice ?? null;
+
+  const momentum =
+    previousPrice && previousPrice > 0
+      ? (price - previousPrice) / previousPrice
+      : 0;
+
+  const avgEntry = inst.avgEntryPrice || 0;
+
+  const pnlPct =
+    avgEntry > 0
+      ? (price - avgEntry) / avgEntry
+      : null;
+
+  const referencePrice = avgEntry > 0 ? avgEntry : price;
+  const dropFromEntry =
+    (referencePrice - price) / referencePrice;
+
+  const staircase = (this.strategy.staircase || []).map(
+    (step, index) => ({
+      level: index + 1,
+      thresholdPct: step.pctDrop * 100,
+      currentDropPct: dropFromEntry * 100,
+      reached: dropFromEntry >= step.pctDrop,
+      alreadyUsed: Boolean(inst.staircaseUsed?.[index]),
+    })
+  );
+
+  const takeProfitReached =
+  pnlPct !== null &&
+  (this.strategy.takeProfitPct ?? 0.08) > 0 &&
+  pnlPct >= (this.strategy.takeProfitPct ?? 0.08);
+
+const stopLossReached =
+  pnlPct !== null &&
+  (this.strategy.stopLossPct ?? 0.15) > 0 &&
+  pnlPct <= -(this.strategy.stopLossPct ?? 0.15);
+  const signalReasons: string[] = [];
+
+if (!smaReady) {
+  signalReasons.push("SMA: очікуємо 5 попередніх цін");
+} else if (smaDeviation !== null) {
+  if (smaDeviation <= -0.003) {
+    signalReasons.push("SMA BUY: поріг досягнуто");
+  } else if (smaDeviation >= 0.003) {
+    signalReasons.push("SMA SELL: поріг досягнуто");
+  } else {
+    signalReasons.push(
+      `SMA: потрібно відхилення ±0.3%, зараз ${(
+        smaDeviation * 100
+      ).toFixed(4)}%`
+    );
+  }
+}
+
+if (momentum > 0.003) {
+  signalReasons.push("Momentum: позитивний поріг досягнуто");
+} else {
+  signalReasons.push(
+    `Momentum: очікуємо +0.3%, зараз ${(momentum * 100).toFixed(4)}%`
+  );
+}
+
+const reachedStaircase = staircase.filter(
+  (step) => step.reached && !step.alreadyUsed
+);
+
+if (reachedStaircase.length > 0) {
+  signalReasons.push("Staircase: є досягнутий рівень");
+} else {
+  signalReasons.push("Staircase: рівні докупівлі не досягнуті");
+}
+
+if (pnlPct === null) {
+  signalReasons.push("TP/SL: немає ціни входу");
+} else {
+  if (!takeProfitReached) {
+    signalReasons.push("Take Profit: поріг не досягнуто");
+  }
+
+  if (!stopLossReached) {
+    signalReasons.push("Stop Loss: поріг не досягнуто");
+  }
+}
+
+if (this.state.cashUsd <= 0) {
+  signalReasons.push("Покупки заблоковані: немає вільних коштів");
+}
+  diagnostics.push({
+    instId: inst.instId,
+    price,
+    avgEntryPrice: avgEntry,
+    quantity: inst.quantity,
+    allocatedUsd: inst.allocatedUsd,
+    cashUsd: this.state.cashUsd,
+
+    pnlPct:
+      pnlPct === null ? null : Number((pnlPct * 100).toFixed(4)),
+
+    momentumPct: Number((momentum * 100).toFixed(4)),
+    momentumThresholdPct: 0.3,
+    momentumReached: momentum > 0.003,
+
+    sma: sma ? Number(sma.toFixed(8)) : null,
+    smaDeviationPct:
+      smaDeviation === null
+        ? null
+        : Number((smaDeviation * 100).toFixed(4)),
+    smaBuyReached:
+      smaDeviation !== null && smaDeviation <= -0.003,
+    smaSellReached:
+      smaDeviation !== null && smaDeviation >= 0.003,
+    smaReady,
+
+    dropFromEntryPct: Number((dropFromEntry * 100).toFixed(4)),
+    staircase,
+    signalReasons,
+
+    takeProfitReached:
+      pnlPct !== null &&
+      (this.strategy.takeProfitPct ?? 0.08) > 0 &&
+      pnlPct >= (this.strategy.takeProfitPct ?? 0.08),
+
+    stopLossReached:
+      pnlPct !== null &&
+      (this.strategy.stopLossPct ?? 0.15) > 0 &&
+      pnlPct <= -(this.strategy.stopLossPct ?? 0.15),
+  });
+}
+
+    */
+    // Виконуємо сигнали послідовно з повторною перевіркою балансу.
+    const executed: Order[] = [];
+
+    for (const order of orders) {
+      const result = await this._executeAndApply(order);
+
+      if (result) {
+        executed.push(result);
+      }
+    }
+
+    // Оновлюємо попередні ціни після всіх розрахунків.
+    for (const inst of this.state.instStates) {
+      const price = prices.find((p) => p.instId === inst.instId)?.price;
+
+      if (price && Number.isFinite(price) && price > 0) {
+        inst.prevPrice = price;
+      }
+    }
+
+    this.state.updatedAt = nowIso();
+
+    await this.saveState();
+    await this._saveTrades(executed);
+return {
+  orders: executed,
+  // ЛАБОРАТОРІЯ: розкоментувати разом із блоком діагностики вище.
+  // diagnostics,
+};
+  }
+
+  // Зміна ціни відносно попереднього tick.
+  async evaluateMomentum(
+    prices: PricePoint[]
+  ): Promise<Record<InstId, number>> {
+    const result: Record<InstId, number> = {};
+
+    for (const inst of this.state.instStates) {
+      const price = prices.find(
+        (p) => p.instId === inst.instId
+      )?.price;
+
+      const previousPrice = inst.prevPrice;
+
+      result[inst.instId] =
+        price &&
+        previousPrice &&
+        price > 0 &&
+        previousPrice > 0
+          ? (price - previousPrice) / previousPrice
+          : 0;
+    }
+
+    return result;
+  }
+
+  // Перевірка та виконання одного симуляційного ордера.
+  private async _executeAndApply(
+    requested: Order
+  ): Promise<Order | null> {
+    const inst = this.state.instStates.find(
+      (item: any) => item.instId === requested.instId
+    );
+
+    const price = requested.price;
+
+    if (
+      !inst ||
+      !Number.isFinite(price) ||
+      price <= 0 ||
+      !Number.isFinite(requested.amountUsd) ||
+      requested.amountUsd <= 0
+    ) {
+      return null;
+    }
+
+    let order: Order;
+
+    if (requested.side === "buy") {
+      // Купуємо тільки на наявні вільні кошти.
+      const amountUsd = Math.min(
+        requested.amountUsd,
+        Math.max(0, this.state.cashUsd)
+      );
+
+      if (amountUsd <= 0) {
+        return null;
+      }
+
+      order = {
+        ...requested,
+        price,
+        amountUsd,
+        quantity: amountUsd / price,
+        strategyId: this.state.strategyId,
+        ts: nowIso(),
+      };
     } else {
-      const sold = ord.amountUsd;
-      inst.quantity = Math.max(0, (inst.quantity||0) - ord.quantity);
-      inst.allocatedUsd = Math.max(0, (inst.allocatedUsd||0) - sold);
-      if (inst.quantity === 0) inst.avgEntryPrice = 0;
+      // Продаємо тільки фактичну кількість монет.
+      const requestedQuantity =
+        requested.quantity > 0
+          ? requested.quantity
+          : requested.amountUsd / price;
+
+      const quantity = Math.min(
+        Math.max(0, requestedQuantity),
+        Math.max(0, inst.quantity || 0)
+      );
+
+      if (quantity <= 0) {
+        return null;
+      }
+
+      order = {
+        ...requested,
+        price,
+        quantity,
+        amountUsd: quantity * price,
+        strategyId: this.state.strategyId,
+        ts: nowIso(),
+      };
+    }
+
+    const executed = await this._execute(order);
+
+    // Додаткова перевірка результату симуляції.
+    if (
+      !Number.isFinite(executed.price) ||
+      executed.price <= 0 ||
+      !Number.isFinite(executed.quantity) ||
+      executed.quantity <= 0 ||
+      !Number.isFinite(executed.amountUsd) ||
+      executed.amountUsd <= 0
+    ) {
+      return null;
+    }
+
+    await this._applyOrderToState(executed);
+
+    return executed;
+  }
+
+  private async _execute(order: Order): Promise<Order> {
+    const normalized: Order = {
+      ...order,
+      id: order.id ?? `sim-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}`,
+      ts: order.ts ?? nowIso(),
+      strategyId: this.state.strategyId,
+    };
+
+    if (this.executeOrderFn) {
+      try {
+        const result = await this.executeOrderFn(normalized);
+
+        return {
+          ...normalized,
+          ...result,
+          ts: nowIso(),
+          strategyId: this.state.strategyId,
+        };
+      } catch (error) {
+        console.error("executeOrderFn failed:", error);
+      }
+    }
+
+    return normalized;
+  }
+
+  // Оновлення позиції та балансу після симуляційної угоди.
+  private async _applyOrderToState(order: Order) {
+    const inst = this.state.instStates.find(
+      (item: any) => item.instId === order.instId
+    );
+
+    if (!inst) {
+      return;
+    }
+
+    if (order.side === "buy") {
+      const amountUsd = Math.min(
+        order.amountUsd,
+        Math.max(0, this.state.cashUsd)
+      );
+
+      const quantity = Math.min(
+        order.quantity,
+        amountUsd / order.price
+      );
+
+      if (amountUsd <= 0 || quantity <= 0) {
+        return;
+      }
+
+      const actualAmount = quantity * order.price;
+      const previousQuantity = inst.quantity || 0;
+      const previousCost =
+        previousQuantity * (inst.avgEntryPrice || 0);
+
+      const totalQuantity = previousQuantity + quantity;
+
+      inst.quantity = totalQuantity;
+      inst.avgEntryPrice =
+        totalQuantity > 0
+          ? (previousCost + actualAmount) / totalQuantity
+          : order.price;
+
+      inst.allocatedUsd =
+        (inst.allocatedUsd || 0) + actualAmount;
+
+      inst.lastBuyTimestamp = nowIso();
+
+      const staircaseMatch = order.reason?.match(
+        /staircase_buy_step_(\d+)/
+      );
+
+      if (staircaseMatch) {
+        const stepIndex = Number.parseInt(staircaseMatch[1], 10);
+
+        inst.staircaseUsed = {
+          ...(inst.staircaseUsed || {}),
+          [stepIndex]: true,
+        };
+      }
+
+      this.state.cashUsd = clamp(
+        this.state.cashUsd - actualAmount,
+        0,
+        this.state.capitalUsd
+      );
+    } else {
+      const availableQuantity = Math.max(0, inst.quantity || 0);
+      const soldQuantity = Math.min(
+        order.quantity,
+        availableQuantity
+      );
+
+      if (soldQuantity <= 0) {
+        return;
+      }
+
+      const proceeds = soldQuantity * order.price;
+      const costBasisSold =
+        soldQuantity * (inst.avgEntryPrice || 0);
+
+      inst.quantity = Math.max(
+        0,
+        availableQuantity - soldQuantity
+      );
+
+      // allocatedUsd зберігає собівартість залишку позиції.
+      inst.allocatedUsd = Math.max(
+        0,
+        (inst.allocatedUsd || 0) - costBasisSold
+      );
+
+      if (inst.quantity <= 1e-12) {
+        inst.quantity = 0;
+        inst.allocatedUsd = 0;
+        inst.avgEntryPrice = 0;
+      }
+
       inst.lastSellTimestamp = nowIso();
-      this.state.cashUsd = clamp(this.state.cashUsd + sold, 0, this.state.capitalUsd);
+
+      // У вільні кошти надходить фактична сума продажу.
+      this.state.cashUsd = clamp(
+        this.state.cashUsd + proceeds,
+        0,
+        this.state.capitalUsd
+      );
     }
   }
 
   async saveState() {
     const db = await this.getDb();
-    const coll = db.collection("multi_state");
-    const q = { strategyId: this.state.strategyId || this.strategy.id || this.strategy.name || "multi-default" };
-    await coll.updateOne(q, { $set: { ...this.state, updatedAt: nowIso() } }, { upsert: true });
+    const collection = db.collection("multi_state");
+
+    const strategyId =
+      this.state.strategyId ||
+      this.strategy.id ||
+      this.strategy.name ||
+      "multi-default";
+
+    await collection.updateOne(
+      { strategyId },
+      {
+        $set: {
+          ...this.state,
+          strategyId,
+          updatedAt: nowIso(),
+        },
+      },
+      { upsert: true }
+    );
   }
 
   async loadState() {
     const db = await this.getDb();
-    const coll = db.collection("multi_state");
-    const doc = await coll.findOne({ strategyId: this.state.strategyId || this.strategy.id || this.strategy.name || "multi-default" });
-    if (doc) this.state = { ...this.state, ...(doc as any) };
+    const collection = db.collection("multi_state");
+
+    const strategyId =
+      this.state.strategyId ||
+      this.strategy.id ||
+      this.strategy.name ||
+      "multi-default";
+
+    const document = await collection.findOne({ strategyId });
+
+    if (document) {
+      this.state = {
+        ...this.state,
+        ...(document as any),
+        strategyId,
+      };
+    }
+
     return this.state;
   }
 
+  // Зберігаємо історію окремо для кожної стратегії.
   async _saveTrades(trades: Order[]) {
-    if (!trades || trades.length === 0) return;
+    if (!trades || trades.length === 0) {
+      return;
+    }
+
     const db = await this.getDb();
-    const coll = db.collection("multi_trades");
-    const docs = trades.map(t => ({...t, createdAt: nowIso()}));
-    await coll.insertMany(docs);
+    const collection = db.collection("multi_trades");
+
+    const strategyId =
+      this.state.strategyId ||
+      this.strategy.id ||
+      this.strategy.name ||
+      "multi-default";
+
+    const documents = trades.map((trade) => ({
+      ...trade,
+      strategyId,
+      createdAt: trade.ts ?? nowIso(),
+    }));
+
+    await collection.insertMany(documents);
   }
 }
