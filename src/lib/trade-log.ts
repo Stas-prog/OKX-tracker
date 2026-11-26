@@ -2,7 +2,8 @@ import type { Db, Document } from "mongodb";
 
 export type TradeDoc = {
   _id?: any;
-  source: "trades" | "vt_trades" | "multi_trades";
+  source: "trades" | "vt_trades"; 
+  // | "multi_trades";
   instId: string;
   side: "buy" | "sell";
   price: number;
@@ -40,11 +41,11 @@ export async function getTradeHistory(db: Db, limit = 100) {
         pipeline: [{ $project: { ...baseProject, source: { $literal: "vt_trades" } } }]
       }
     },
-    { $unionWith: {
-        coll: "multi_trades",
-        pipeline: [{ $project: { ...baseProject, source: { $literal: "multi_trades" } } }]
-      }
-    },
+    // { $unionWith: {
+    //     coll: "multi_trades",
+    //     pipeline: [{ $project: { ...baseProject, source: { $literal: "multi_trades" } } }]
+    //   }
+    // },
     { $addFields: {
         sortTs: {
           $ifNull: [

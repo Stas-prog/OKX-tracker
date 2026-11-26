@@ -16,8 +16,8 @@ let mn = 0;
 let del = 1;
 let stepsUsd = [1]; 
 let stepsBtc = [1];
-let buyBelow = 0.005;
-let sellAbove = -0.005;
+let buyBelow = 0.0006;
+let sellAbove = -0.0002;
 let lastTxn: LastTxn = null;
 
 type VTStateDoc = {
@@ -87,13 +87,13 @@ export function updateWallet(price: number) {
   }
 
   let change = (price - lastPrice) / lastPrice;
-  const pnlp = usdt + (btc * price) - 2180;
+  const pnlp = usdt + (btc * price) - 1600;
 
-  // if(change > 0){
-  //   pl +=1;
-  // } else if (change < 0){ 
-  //   mn +=1;
-  // }
+  if(change > 0){
+    pl +=1;
+  } else if (change < 0){ 
+    mn +=1;
+  }
 
   // if(mn >= 1377){
   //   lastPrice = price;
@@ -123,7 +123,7 @@ console.log("change", change)
     if(change < 0){
     change = change * -1;
     }else{
-      change = change * 20;
+      change = change * 1.5;
   }
   
 }

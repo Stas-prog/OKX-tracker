@@ -41,9 +41,6 @@ export type Order = {
 
 const nowIso = () => new Date().toISOString();
 
-const clamp = (value: number, min: number, max: number) =>
-  Math.max(min, Math.min(max, value));
-
 async function defaultGetDb(): Promise<Db> {
   throw new Error(
     "MultiTrader: please provide getDb() implementation when constructing."
@@ -582,15 +579,16 @@ if (this.state.cashUsd <= 0) {
 
     */
     // Виконуємо сигнали послідовно з повторною перевіркою балансу.
-    const executed: Order[] = [];
+    // Execute orders sequentially with balance and position validation.
+const executed: Order[] = [];
 
-    for (const order of orders) {
-      const result = await this._executeAndApply(order);
+for (const order of orders) {
+  const result = await this._executeAndApply(order);
 
-      if (result) {
-        executed.push(result);
-      }
-    }
+  if (result) {
+    executed.push(result);
+  }
+}
 
     // Оновлюємо попередні ціни після всіх розрахунків.
     for (const inst of this.state.instStates) {
@@ -704,22 +702,49 @@ return {
       };
     }
 
-    const executed = await this._execute(order);
+    const fill = await this._execute(order);
 
-    // Додаткова перевірка результату симуляції.
+    // Обліковуємо фактичне виконання executor, а не початковий запит.
+    const fillPrice = Number(fill.price);
+    const requestedFillQuantity = Number(fill.quantity);
+
     if (
-      !Number.isFinite(executed.price) ||
-      executed.price <= 0 ||
-      !Number.isFinite(executed.quantity) ||
-      executed.quantity <= 0 ||
-      !Number.isFinite(executed.amountUsd) ||
-      executed.amountUsd <= 0
+      !Number.isFinite(fillPrice) ||
+      fillPrice <= 0 ||
+      !Number.isFinite(requestedFillQuantity) ||
+      requestedFillQuantity <= 0
     ) {
       return null;
     }
 
-    await this._applyOrderToState(executed);
+    const fillQuantity =
+      order.side === "buy"
+        ? Math.min(
+            requestedFillQuantity,
+            Math.max(0, this.state.cashUsd) / fillPrice
+          )
+        : Math.min(
+            requestedFillQuantity,
+            Math.max(0, inst.quantity || 0)
+          );
 
+    if (!Number.isFinite(fillQuantity) || fillQuantity <= 1e-12) {
+      return null;
+    }
+
+    const executed: Order = {
+      ...order,
+      ...fill,
+      instId: order.instId,
+      side: order.side,
+      price: fillPrice,
+      quantity: fillQuantity,
+      amountUsd: fillQuantity * fillPrice,
+      strategyId: this.state.strategyId,
+      ts: fill.ts ?? nowIso(),
+    };
+
+    await this._applyOrderToState(executed);
     return executed;
   }
 
@@ -745,6 +770,7 @@ return {
         };
       } catch (error) {
         console.error("executeOrderFn failed:", error);
+        throw error;
       }
     }
 
@@ -807,10 +833,9 @@ return {
         };
       }
 
-      this.state.cashUsd = clamp(
-        this.state.cashUsd - actualAmount,
+      this.state.cashUsd = Math.max(
         0,
-        this.state.capitalUsd
+        Number(this.state.cashUsd || 0) - actualAmount
       );
     } else {
       const availableQuantity = Math.max(0, inst.quantity || 0);
@@ -847,10 +872,9 @@ return {
       inst.lastSellTimestamp = nowIso();
 
       // У вільні кошти надходить фактична сума продажу.
-      this.state.cashUsd = clamp(
-        this.state.cashUsd + proceeds,
+      this.state.cashUsd = Math.max(
         0,
-        this.state.capitalUsd
+        Number(this.state.cashUsd || 0) + proceeds
       );
     }
   }

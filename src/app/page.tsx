@@ -7,7 +7,7 @@ import VirtualTraderTable from './components/VirtualTraderTable';
 import TradeHistoryTable from './components/TradeHistoryTable';
 import BTCChart from './components/BTCChart'
 import Bot from './components/Bot'
-import Link from 'next/link';
+// import Link from 'next/link';
 
 
 
@@ -62,10 +62,10 @@ export default function HomePage() {
       <VirtualTraderTable />
       <TradeHistoryTable />
       <BTCChart />
-      <Link href="/multi-trader" className="mt-6 px-4 py-2 bg-blue-600 rounded hover:bg-blue-700 inline-block">
-        Перейти до MultiTrader
-      </Link>
       <Bot />
     </main>
   )
 }
+/* <Link href="/multi-trader" className="mt-6 px-4 py-2 bg-blue-600 rounded hover:bg-blue-700 inline-block">
+        Перейти до MultiTrader
+      </Link> */
