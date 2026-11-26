@@ -1,4 +1,20 @@
+// MultiTrader cron is intentionally disabled.
+// The simulator is preserved in the repository,
+// but it is not part of the active trading system.
 
+export const runtime = "nodejs";
+export const dynamic = "force-dynamic";
+
+export async function GET() {
+  return Response.json(
+    {
+      ok: false,
+      disabled: true,
+      message: "MultiTrader is currently disabled",
+    },
+    { status: 410 }
+  );
+}
 // import { NextResponse } from "next/server";
 // import { MultiTrader } from "@/utils/multiTrader";
 // import { getPrice } from "@/lib/okxClient";
